@@ -2,11 +2,13 @@
 
 一个低负荷的 NekoAPI 桌面用量监视器。应用常驻系统菜单栏，显示今日消费、余额、Token 用量和平台分布。
 
-## 第一版功能
+## 功能
 
 - NekoAPI 账号登录和 TOTP 二次验证
 - access token / refresh token 存入系统钥匙串
-- 每次同步仅请求用户资料和用量汇总两个只读接口
+- 概览和记录双页面，提供 7 日消费图及最近请求明细
+- 显示有效订阅的日、周、月消耗、剩余额度、到期和重置时间
+- 每次常规同步仅请求用户资料、用量汇总和有效订阅三个只读接口
 - 15、30、60 分钟自动刷新，附带 ±10% 随机抖动
 - 手动刷新 30 秒冷却，失败后指数退避，最长两小时
 - 隐藏窗口后继续通过菜单栏显示、刷新或退出
@@ -40,6 +42,12 @@ npm run tauri build -- --bundles app
 
 - `GET /user/profile`
 - `GET /usage/dashboard/stats`
+- `GET /subscriptions/active`
+
+以下接口按需加载，打开对应页面时缓存 15 分钟，不参与后台轮询：
+
+- `GET /usage/dashboard/trend`（概览中的 7 日趋势）
+- `GET /usage`（记录页中的最近 18 条请求）
 
 仅在 access token 返回 401 时调用一次 `/auth/refresh`。应用不会抓取网页、模拟点击、绕过 CAPTCHA 或轮询消费明细。
 

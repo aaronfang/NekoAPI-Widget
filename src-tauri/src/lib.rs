@@ -35,6 +35,8 @@ enum LoginOutcome {
 struct DashboardSnapshot {
     profile: Value,
     stats: Value,
+    subscriptions: Value,
+    subscriptions_error: Option<String>,
     fetched_at: u64,
 }
 
@@ -227,15 +229,23 @@ async fn get_authorized(
     Ok((status, value))
 }
 
-async fn fetch_pair(client: &Client, token: &str) -> Result<(Value, Value), String> {
-    let (profile_result, stats_result) = tokio::join!(
+async fn fetch_dashboard_data(
+    client: &Client,
+    token: &str,
+) -> Result<(Value, Value, Value, Option<String>), String> {
+    let (profile_result, stats_result, subscriptions_result) = tokio::join!(
         get_authorized(client, "/user/profile", token),
-        get_authorized(client, "/usage/dashboard/stats", token)
+        get_authorized(client, "/usage/dashboard/stats", token),
+        get_authorized(client, "/subscriptions/active", token)
     );
     let (profile_status, profile) = profile_result?;
     let (stats_status, stats) = stats_result?;
+    let (subscriptions_status, subscriptions) = subscriptions_result?;
 
-    if profile_status == StatusCode::UNAUTHORIZED || stats_status == StatusCode::UNAUTHORIZED {
+    if profile_status == StatusCode::UNAUTHORIZED
+        || stats_status == StatusCode::UNAUTHORIZED
+        || subscriptions_status == StatusCode::UNAUTHORIZED
+    {
         return Err("__SESSION_EXPIRED__".to_string());
     }
     if !profile_status.is_success() {
@@ -251,14 +261,31 @@ async fn fetch_pair(client: &Client, token: &str) -> Result<(Value, Value), Stri
         ));
     }
 
-    Ok((unwrap_payload(profile)?, unwrap_payload(stats)?))
+    let (subscriptions, subscriptions_error) = if subscriptions_status.is_success() {
+        (unwrap_payload(subscriptions)?, None)
+    } else {
+        (
+            Value::Array(Vec::new()),
+            Some(api_error(
+                &subscriptions,
+                &format!("订阅请求失败（HTTP {subscriptions_status}）"),
+            )),
+        )
+    };
+
+    Ok((
+        unwrap_payload(profile)?,
+        unwrap_payload(stats)?,
+        subscriptions,
+        subscriptions_error,
+    ))
 }
 
 #[tauri::command]
 async fn fetch_dashboard(state: tauri::State<'_, ApiState>) -> Result<DashboardSnapshot, String> {
     let mut session = load_session()?.ok_or_else(|| "请先登录".to_string())?;
-    let pair = match fetch_pair(&state.client, &session.access_token).await {
-        Ok(pair) => pair,
+    let data = match fetch_dashboard_data(&state.client, &session.access_token).await {
+        Ok(data) => data,
         Err(error) if error == "__SESSION_EXPIRED__" => {
             session = refresh_session(&state.client, &session)
                 .await
@@ -266,7 +293,7 @@ async fn fetch_dashboard(state: tauri::State<'_, ApiState>) -> Result<DashboardS
                     let _ = delete_session();
                     error
                 })?;
-            fetch_pair(&state.client, &session.access_token)
+            fetch_dashboard_data(&state.client, &session.access_token)
                 .await
                 .map_err(|error| {
                     if error == "__SESSION_EXPIRED__" {
@@ -285,10 +312,74 @@ async fn fetch_dashboard(state: tauri::State<'_, ApiState>) -> Result<DashboardS
         .unwrap_or_default()
         .as_secs();
     Ok(DashboardSnapshot {
-        profile: pair.0,
-        stats: pair.1,
+        profile: data.0,
+        stats: data.1,
+        subscriptions: data.2,
+        subscriptions_error: data.3,
         fetched_at,
     })
+}
+
+async fn get_payload_with_refresh(
+    client: &Client,
+    path: &str,
+    session: &mut Session,
+) -> Result<Value, String> {
+    let (mut status, mut value) = get_authorized(client, path, &session.access_token).await?;
+    if status == StatusCode::UNAUTHORIZED {
+        *session = refresh_session(client, session).await.map_err(|error| {
+            let _ = delete_session();
+            error
+        })?;
+        (status, value) = get_authorized(client, path, &session.access_token).await?;
+    }
+
+    if status == StatusCode::UNAUTHORIZED {
+        let _ = delete_session();
+        return Err("登录已过期，请重新登录".to_string());
+    }
+    if !status.is_success() {
+        return Err(api_error(&value, &format!("请求失败（HTTP {status}）")));
+    }
+    unwrap_payload(value)
+}
+
+fn valid_date(value: &str) -> bool {
+    value.len() == 10
+        && value
+            .chars()
+            .enumerate()
+            .all(|(index, character)| match index {
+                4 | 7 => character == '-',
+                _ => character.is_ascii_digit(),
+            })
+}
+
+#[tauri::command]
+async fn fetch_usage_trend(
+    state: tauri::State<'_, ApiState>,
+    start_date: String,
+    end_date: String,
+) -> Result<Value, String> {
+    if !valid_date(&start_date) || !valid_date(&end_date) {
+        return Err("趋势日期格式无效".to_string());
+    }
+    let mut session = load_session()?.ok_or_else(|| "请先登录".to_string())?;
+    let path = format!(
+        "/usage/dashboard/trend?start_date={start_date}&end_date={end_date}&granularity=day"
+    );
+    get_payload_with_refresh(&state.client, &path, &mut session).await
+}
+
+#[tauri::command]
+async fn fetch_usage_records(state: tauri::State<'_, ApiState>) -> Result<Value, String> {
+    let mut session = load_session()?.ok_or_else(|| "请先登录".to_string())?;
+    get_payload_with_refresh(
+        &state.client,
+        "/usage?page=1&page_size=18&sort_by=created_at&sort_order=desc",
+        &mut session,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -316,7 +407,7 @@ fn toggle_main_window(app: &tauri::AppHandle) {
 pub fn run() {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(20))
-        .user_agent("NekoAPI-Widget/0.1 (+low-frequency account monitor)")
+        .user_agent("NekoAPI-Widget/0.2 (+low-frequency account monitor)")
         .build()
         .expect("failed to build HTTP client");
 
@@ -326,6 +417,8 @@ pub fn run() {
             login,
             login_two_factor,
             fetch_dashboard,
+            fetch_usage_trend,
+            fetch_usage_records,
             has_session,
             logout
         ])
