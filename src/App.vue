@@ -11,7 +11,13 @@ const DETAIL_STALE_MS = 15 * 60_000
 const DAY_MS = 86_400_000
 
 type Tab = 'overview' | 'records'
+type PopoverSide = 'above' | 'below' | 'left' | 'right'
 type JsonRecord = Record<string, unknown>
+
+interface PopoverPlacementEvent {
+  placement: PopoverSide
+  anchorOffset: number
+}
 
 interface DetailCache {
   trend: unknown
@@ -93,6 +99,8 @@ const booting = ref(!previewMode)
 const loading = ref(false)
 const detailLoading = ref(false)
 const settingsOpen = ref(false)
+const popoverSide = ref<PopoverSide>('below')
+const pointerOffset = ref('50%')
 const activeTab = ref<Tab>(previewTab)
 const authStep = ref<'login' | 'totp'>('login')
 const account = ref('')
@@ -112,6 +120,7 @@ let refreshTimer: number | undefined
 let noticeTimer: number | undefined
 let lastManualRefresh = 0
 let unlistenRefresh: UnlistenFn | undefined
+let unlistenPlacement: UnlistenFn | undefined
 
 function readCache(): DashboardSnapshot | null {
   try {
@@ -532,6 +541,11 @@ onMounted(async () => {
     booting.value = false
   }
   unlistenRefresh = await listen('refresh-requested', () => refreshData(true))
+  unlistenPlacement = await listen<PopoverPlacementEvent>('popover-placement', ({ payload }) => {
+    if (!['above', 'below', 'left', 'right'].includes(payload.placement)) return
+    popoverSide.value = payload.placement
+    pointerOffset.value = `${payload.anchorOffset / window.devicePixelRatio}px`
+  })
   document.addEventListener('visibilitychange', onVisibilityChange)
 })
 
@@ -540,6 +554,7 @@ onBeforeUnmount(() => {
   if (noticeTimer) window.clearTimeout(noticeTimer)
   document.removeEventListener('visibilitychange', onVisibilityChange)
   unlistenRefresh?.()
+  unlistenPlacement?.()
 })
 </script>
 
@@ -574,7 +589,7 @@ onBeforeUnmount(() => {
       <div class="auth-footnote"><span></span>默认每 15 分钟刷新，不抓取网页</div>
     </section>
 
-    <section v-else class="widget-view">
+    <section v-else class="widget-view" :class="`popover-${popoverSide}`" :style="{ '--pointer-offset': pointerOffset }">
       <div class="panel-shell">
         <div class="panel-pointer"></div>
         <nav class="segmented"><button :class="{ active: activeTab === 'overview' }" @click="selectTab('overview')">概览</button><button :class="{ active: activeTab === 'records' }" @click="selectTab('records')">记录</button></nav>

@@ -475,6 +475,7 @@ fn logout(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 fn position_bubble(window: &tauri::WebviewWindow, rect: Rect) {
     let scale = window.scale_factor().unwrap_or(1.0);
     let tray_position = rect.position.to_physical::<f64>(scale);
@@ -498,6 +499,105 @@ fn position_bubble(window: &tauri::WebviewWindow, rect: Rect) {
         y = y.max(work.position.y as f64 + 2.0);
     }
 
+    let _ = window.set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32));
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PopoverPlacement {
+    placement: &'static str,
+    anchor_offset: f64,
+}
+
+#[cfg(target_os = "windows")]
+fn position_bubble(window: &tauri::WebviewWindow, rect: Rect) {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let tray_position = rect.position.to_physical::<f64>(scale);
+    let tray_size = rect.size.to_physical::<f64>(scale);
+    let window_size = match window.outer_size() {
+        Ok(size) => size,
+        Err(_) => return,
+    };
+    let width = window_size.width as f64;
+    let height = window_size.height as f64;
+    let anchor_x = tray_position.x + tray_size.width / 2.0;
+    let anchor_y = tray_position.y + tray_size.height / 2.0;
+
+    let (x, y, placement, anchor_offset) =
+        if let Ok(Some(monitor)) = window.monitor_from_point(anchor_x, anchor_y) {
+            let full_left = monitor.position().x as f64;
+            let full_top = monitor.position().y as f64;
+            let full_right = full_left + monitor.size().width as f64;
+            let full_bottom = full_top + monitor.size().height as f64;
+            let work = monitor.work_area();
+            let work_left = work.position.x as f64;
+            let work_top = work.position.y as f64;
+            let work_right = work_left + work.size.width as f64;
+            let work_bottom = work_top + work.size.height as f64;
+            let gap = 6.0;
+            let min_x = work_left + gap;
+            let max_x = (work_right - width - gap).max(min_x);
+            let min_y = work_top + gap;
+            let max_y = (work_bottom - height - gap).max(min_y);
+            let centered_x = (anchor_x - width / 2.0).clamp(min_x, max_x);
+            let centered_y = (anchor_y - height / 2.0).clamp(min_y, max_y);
+            let distances = [
+                (anchor_y - full_top).abs(),
+                (full_bottom - anchor_y).abs(),
+                (anchor_x - full_left).abs(),
+                (full_right - anchor_x).abs(),
+            ];
+            let nearest_edge = distances
+                .iter()
+                .enumerate()
+                .min_by(|left, right| left.1.total_cmp(right.1))
+                .map(|(index, _)| index)
+                .unwrap_or(1);
+
+            match nearest_edge {
+                // Taskbar at the top: open below it.
+                0 => (
+                    centered_x,
+                    work_top + gap,
+                    "below",
+                    (anchor_x - centered_x).clamp(24.0, width - 24.0),
+                ),
+                // Taskbar at the bottom: open above it.
+                1 => (
+                    centered_x,
+                    work_bottom - height - gap,
+                    "above",
+                    (anchor_x - centered_x).clamp(24.0, width - 24.0),
+                ),
+                // Taskbar at the left: open to its right.
+                2 => (
+                    work_left + gap,
+                    centered_y,
+                    "right",
+                    (anchor_y - centered_y).clamp(24.0, height - 24.0),
+                ),
+                // Taskbar at the right: open to its left.
+                _ => (
+                    work_right - width - gap,
+                    centered_y,
+                    "left",
+                    (anchor_y - centered_y).clamp(24.0, height - 24.0),
+                ),
+            }
+        } else {
+            let x = anchor_x - width / 2.0;
+            let y = (tray_position.y - height - 6.0).max(0.0);
+            (x, y, "above", width / 2.0)
+        };
+
+    let _ = window.emit(
+        "popover-placement",
+        PopoverPlacement {
+            placement,
+            anchor_offset,
+        },
+    );
     let _ = window.set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32));
 }
 
@@ -529,7 +629,7 @@ fn toggle_main_window(app: &tauri::AppHandle, tray_rect: Option<Rect>) {
 pub fn run() {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(20))
-        .user_agent("NekoAPI-Widget/0.4 (+low-frequency account monitor)")
+        .user_agent("NekoAPI-Widget/0.4.1 (+low-frequency account monitor)")
         .build()
         .expect("failed to build HTTP client");
 

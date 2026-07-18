@@ -68,7 +68,13 @@ input::placeholder { color: #515863; }
 .round-button.rotating svg { animation: rotate .8s linear infinite; }
 
 .panel-shell { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; border: 1px solid rgba(170,181,196,.2); border-radius: 25px; background: linear-gradient(160deg, rgba(23,29,39,.99), rgba(16,21,29,.995)); box-shadow: inset 0 1px rgba(255,255,255,.04), 0 18px 60px rgba(0,0,0,.32); }
-.panel-pointer { position: absolute; z-index: 0; top: -9px; left: 50%; width: 20px; height: 20px; border-top: 1px solid rgba(170,181,196,.2); border-left: 1px solid rgba(170,181,196,.2); background: #171d27; transform: translateX(-50%) rotate(45deg); border-radius: 5px 0 0; }
+.panel-pointer { position: absolute; z-index: 0; top: -9px; left: var(--pointer-offset, 50%); width: 20px; height: 20px; border-top: 1px solid rgba(170,181,196,.2); border-left: 1px solid rgba(170,181,196,.2); background: #171d27; transform: translateX(-50%) rotate(45deg); border-radius: 5px 0 0; }
+.widget-view.popover-above { padding: 7px 7px 11px; }
+.popover-above .panel-pointer { top: auto; bottom: -9px; transform: translateX(-50%) rotate(225deg); }
+.widget-view.popover-left { padding: 7px 11px 7px 7px; }
+.popover-left .panel-pointer { top: var(--pointer-offset, 50%); right: -9px; left: auto; transform: translateY(-50%) rotate(135deg); }
+.widget-view.popover-right { padding: 7px 7px 7px 11px; }
+.popover-right .panel-pointer { top: var(--pointer-offset, 50%); left: -9px; transform: translateY(-50%) rotate(315deg); }
 .segmented { z-index: 2; align-self: center; flex: 0 0 auto; display: grid; grid-template-columns: 1fr 1fr; width: 206px; margin: 15px auto 11px; padding: 3px; border: 1px solid var(--line); border-radius: 16px; background: rgba(91,101,115,.18); }
 .segmented button { height: 31px; border: 0; border-radius: 13px; background: transparent; color: #757d89; font-size: 12px; font-weight: 600; cursor: pointer; }
 .segmented button.active { color: #e4e7eb; background: linear-gradient(180deg, rgba(125,137,153,.45), rgba(101,112,127,.35)); box-shadow: inset 0 1px rgba(255,255,255,.08), 0 2px 7px rgba(0,0,0,.14); }
