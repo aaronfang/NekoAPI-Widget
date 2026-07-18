@@ -41,6 +41,22 @@ cargo check --manifest-path src-tauri/Cargo.toml
 npm run tauri build -- --bundles app
 ```
 
+### Windows
+
+Windows 10/11 x64 使用系统 Credential Manager 保存令牌，并通过 NSIS 安装包分发。安装程序会在需要时静默引导安装 Microsoft WebView2 Runtime。
+
+在 Windows 开发机上运行：
+
+```powershell
+npm ci
+npm run tauri dev
+npm run tauri build -- --bundles nsis
+```
+
+仓库中的 `Build Windows` GitHub Actions 工作流会在原生 `windows-latest` 环境执行前端检查、Rust Windows 目标检查和 NSIS 打包，并上传可下载的 `.exe` artifact。
+
+> Windows 系统托盘不支持 macOS 式的常驻文字标题，因此今日 Token 和订阅百分比显示在托盘提示中；点击托盘图标仍会显示同一套锚定气泡界面。
+
 ## 请求策略
 
 应用固定连接 `https://999555999.com/api/v1`。正常刷新只读取：
