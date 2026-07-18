@@ -310,27 +310,35 @@ fn compact_tokens(value: f64) -> String {
 
 fn update_tray_summary(app: &tauri::AppHandle, stats: &Value, subscriptions: &Value) {
     let today_tokens = json_number(stats, "today_tokens");
-    let monthly = subscriptions.as_array().and_then(|items| {
-        items.iter().find_map(|subscription| {
-            let group = subscription.get("group")?;
-            let limit = json_number(group, "monthly_limit_usd");
-            (limit > 0.0).then(|| {
-                let used = json_number(subscription, "monthly_usage_usd");
-                (used, limit, (used / limit * 100.0).clamp(0.0, 999.0))
+    let quota = subscriptions.as_array().and_then(|items| {
+        [
+            ("monthly_limit_usd", "monthly_usage_usd", "月额度"),
+            ("weekly_limit_usd", "weekly_usage_usd", "周额度"),
+            ("daily_limit_usd", "daily_usage_usd", "日额度"),
+        ]
+        .into_iter()
+        .find_map(|(limit_key, usage_key, label)| {
+            items.iter().find_map(|subscription| {
+                let group = subscription.get("group")?;
+                let limit = json_number(group, limit_key);
+                (limit > 0.0).then(|| {
+                    let used = json_number(subscription, usage_key);
+                    (used, limit, (used / limit * 100.0).clamp(0.0, 999.0), label)
+                })
             })
         })
     });
 
     let token_label = compact_tokens(today_tokens);
-    let (title, tooltip) = if let Some((used, limit, percent)) = monthly {
+    let (title, tooltip) = if let Some((used, limit, percent, label)) = quota {
         (
-            format!("{token_label} · ${used:.2} · {percent:.0}%"),
-            format!("今日 Token {token_label} · 月额度 ${used:.2} / ${limit:.2}（{percent:.1}%）"),
+            format!("{token_label} · {percent:.0}%"),
+            format!("今日 Token {token_label} · {label} ${used:.2} / ${limit:.2}（{percent:.1}%）"),
         )
     } else {
         (
             format!("{token_label} · --%"),
-            format!("今日 Token {token_label} · 未检测到月度额度"),
+            format!("今日 Token {token_label} · 未检测到订阅额度"),
         )
     };
 
@@ -521,7 +529,7 @@ fn toggle_main_window(app: &tauri::AppHandle, tray_rect: Option<Rect>) {
 pub fn run() {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(20))
-        .user_agent("NekoAPI-Widget/0.3 (+low-frequency account monitor)")
+        .user_agent("NekoAPI-Widget/0.4 (+low-frequency account monitor)")
         .build()
         .expect("failed to build HTTP client");
 

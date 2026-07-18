@@ -34,6 +34,7 @@ interface SubscriptionCard {
   name: string
   platform: string
   status: string
+  rateMultiplier: number
   expiresAt?: string
   quotas: QuotaRow[]
 }
@@ -61,19 +62,19 @@ const previewSnapshot: DashboardSnapshot = {
     today_output_tokens: 67_400,
   },
   subscriptions: [
-    { id: 1, status: 'active', expires_at: '2026-08-26T00:00:00Z', daily_usage_usd: 6.72, weekly_usage_usd: 24.8, daily_window_start: '2026-07-18T00:00:00Z', weekly_window_start: '2026-07-14T00:00:00Z', group: { name: 'Claude Pro 开发者套餐', platform: 'anthropic', daily_limit_usd: 10, weekly_limit_usd: 50 } },
-    { id: 2, status: 'active', expires_at: '2026-10-01T00:00:00Z', monthly_usage_usd: 18.4, monthly_window_start: '2026-07-01T00:00:00Z', group: { name: 'OpenAI Codex 月度包', platform: 'openai', monthly_limit_usd: 80 } },
+    { id: 1, status: 'active', expires_at: '2026-08-26T00:00:00Z', daily_usage_usd: 6.72, weekly_usage_usd: 24.8, daily_window_start: '2026-07-18T00:00:00Z', weekly_window_start: '2026-07-14T00:00:00Z', group: { name: 'Claude Pro 开发者套餐', platform: 'anthropic', rate_multiplier: 0.14, daily_limit_usd: 10, weekly_limit_usd: 50 } },
+    { id: 2, status: 'active', expires_at: '2026-10-01T00:00:00Z', monthly_usage_usd: 18.4, monthly_window_start: '2026-07-01T00:00:00Z', group: { name: 'OpenAI Codex 月度包', platform: 'openai', rate_multiplier: 0.07, monthly_limit_usd: 80 } },
   ],
   fetched_at: Math.floor(Date.now() / 1000),
 }
 const previewTrend = { trend: [
-  { date: '2026-07-12', actual_cost: 1.2, input_tokens: 920_000, output_tokens: 180_000 },
-  { date: '2026-07-13', actual_cost: 2.9, input_tokens: 2_140_000, output_tokens: 390_000 },
-  { date: '2026-07-14', actual_cost: .8, input_tokens: 640_000, output_tokens: 130_000 },
-  { date: '2026-07-15', actual_cost: 5.7, input_tokens: 4_320_000, output_tokens: 840_000 },
-  { date: '2026-07-16', actual_cost: 3.4, input_tokens: 2_650_000, output_tokens: 460_000 },
-  { date: '2026-07-17', actual_cost: 4.9, input_tokens: 3_770_000, output_tokens: 710_000 },
-  { date: '2026-07-18', actual_cost: 3.284, input_tokens: 361_200, output_tokens: 67_400 },
+  { date: '2026-07-12', actual_cost: 1.2, input_tokens: 920_000, output_tokens: 180_000, cache_creation_tokens: 90_000, cache_read_tokens: 1_400_000 },
+  { date: '2026-07-13', actual_cost: 2.9, input_tokens: 2_140_000, output_tokens: 390_000, cache_creation_tokens: 160_000, cache_read_tokens: 3_800_000 },
+  { date: '2026-07-14', actual_cost: .8, input_tokens: 640_000, output_tokens: 130_000, cache_creation_tokens: 72_000, cache_read_tokens: 1_900_000 },
+  { date: '2026-07-15', actual_cost: 5.7, input_tokens: 4_320_000, output_tokens: 840_000, cache_creation_tokens: 260_000, cache_read_tokens: 6_400_000 },
+  { date: '2026-07-16', actual_cost: 3.4, input_tokens: 2_650_000, output_tokens: 460_000, cache_creation_tokens: 190_000, cache_read_tokens: 4_700_000 },
+  { date: '2026-07-17', actual_cost: 4.9, input_tokens: 3_770_000, output_tokens: 710_000, cache_creation_tokens: 220_000, cache_read_tokens: 5_500_000 },
+  { date: '2026-07-18', actual_cost: 3.284, input_tokens: 361_200, output_tokens: 67_400, cache_creation_tokens: 48_000, cache_read_tokens: 980_000 },
 ] }
 const previewRecords = { items: Array.from({ length: 11 }, (_, index) => ({
   id: index + 1,
@@ -223,6 +224,7 @@ const subscriptions = computed<SubscriptionCard[]>(() => {
       name: String(group.name ?? subscription.name ?? '订阅套餐'),
       platform: platformName(String(group.platform ?? subscription.platform ?? 'subscription')),
       status: String(subscription.status ?? 'active'),
+      rateMultiplier: Number(group.rate_multiplier ?? subscription.rate_multiplier ?? 1),
       expiresAt: typeof subscription.expires_at === 'string' ? subscription.expires_at : undefined,
       quotas,
     }
@@ -238,29 +240,49 @@ const trendPoints = computed(() => {
     return {
       label: shortDate(String(row.date ?? row.day ?? row.period ?? row.time ?? '')),
       value: Number(row.actual_cost ?? row.cost ?? row.total_actual_cost ?? 0),
-      tokens: Number(row.total_tokens ?? row.tokens ?? 0)
-        || Number(row.input_tokens ?? 0) + Number(row.output_tokens ?? 0)
-        + Number(row.cache_read_tokens ?? 0) + Number(row.cache_creation_tokens ?? 0),
+      input: Number(row.input_tokens ?? 0),
+      output: Number(row.output_tokens ?? 0),
+      cacheCreation: Number(row.cache_creation_tokens ?? 0),
+      cacheRead: Number(row.cache_read_tokens ?? 0),
       index,
     }
   })
   const max = Math.max(...points.map(point => point.value), 0)
-  return points.map(point => ({ ...point, height: max > 0 ? Math.max(5, point.value / max * 100) : 4 }))
+  return points.map(point => {
+    const tokens = point.input + point.output + point.cacheCreation + point.cacheRead
+    const cacheBase = point.input + point.cacheCreation + point.cacheRead
+    return {
+      ...point,
+      tokens,
+      cacheHitRate: cacheBase > 0 ? point.cacheRead / cacheBase * 100 : 0,
+      height: max > 0 ? Math.max(5, point.value / max * 100) : 4,
+    }
+  })
 })
 
 const sevenDayCost = computed(() => trendPoints.value.reduce((sum, point) => sum + point.value, 0))
-const tokenTrendChart = computed(() => {
+const tokenSeriesChart = computed(() => {
   const points = trendPoints.value
-  const max = Math.max(...points.map(point => point.tokens), 0)
-  const coordinates = points.map((point, index) => {
-    const x = points.length <= 1 ? 150 : index / (points.length - 1) * 300
-    const y = max > 0 ? 76 - point.tokens / max * 62 : 76
-    return { ...point, x, y }
-  })
+  const max = Math.max(...points.flatMap(point => [point.input, point.output, point.cacheCreation, point.cacheRead]), 0)
+  const createSeries = (key: string, label: string, values: number[], percent = false) => {
+    const scale = percent ? 100 : max
+    const coordinates = values.map((value, index) => ({
+      x: points.length <= 1 ? 150 : index / (points.length - 1) * 300,
+      y: scale > 0 ? 78 - value / scale * 66 : 78,
+      value,
+      label: points[index]?.label ?? '',
+    }))
+    return { key, label, percent, coordinates, line: coordinates.map(point => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ') }
+  }
   return {
-    coordinates,
-    line: coordinates.map(point => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' '),
-    area: coordinates.length ? `0,82 ${coordinates.map(point => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ')} 300,82` : '',
+    series: [
+      createSeries('input', 'Input', points.map(point => point.input)),
+      createSeries('output', 'Output', points.map(point => point.output)),
+      createSeries('cache-creation', 'Cache Creation', points.map(point => point.cacheCreation)),
+      createSeries('cache-read', 'Cache Read', points.map(point => point.cacheRead)),
+      createSeries('cache-hit', 'Cache Hit Rate', points.map(point => point.cacheHitRate), true),
+    ],
+    labels: points.map(point => point.label),
     max,
   }
 })
@@ -299,6 +321,11 @@ function formatTokens(value: number): string {
   }
   if (value >= 1_000) return `${(value / 1_000).toFixed(1).replace(/\.0$/, '')}K`
   return Math.round(value).toLocaleString('en-US')
+}
+
+function formatMultiplier(value: number): string {
+  if (!Number.isFinite(value)) return '×1'
+  return `×${value.toFixed(4).replace(/\.?0+$/, '')}`
 }
 
 function formatTime(timestamp?: number): string {
@@ -574,7 +601,7 @@ onBeforeUnmount(() => {
             <div class="section-title"><div><strong>订阅额度</strong><span>{{ subscriptions.length ? `${subscriptions.length} 个有效订阅` : '未检测到有效订阅' }}</span></div><small v-if="snapshot?.subscriptions_error">读取失败</small></div>
             <div v-if="subscriptions.length" class="subscription-list">
               <article v-for="subscription in subscriptions" :key="subscription.id" class="subscription-card">
-                <div class="subscription-head"><div><strong>{{ subscription.name }}</strong><span>{{ subscription.platform }} · {{ relativeDate(subscription.expiresAt) }}</span></div><i>{{ subscription.status === 'active' ? '有效' : subscription.status }}</i></div>
+                <div class="subscription-head"><div><strong>{{ subscription.name }}</strong><span>{{ subscription.platform }} · 倍率 {{ formatMultiplier(subscription.rateMultiplier) }} · {{ relativeDate(subscription.expiresAt) }}</span></div><i>{{ subscription.status === 'active' ? '有效' : subscription.status }}</i></div>
                 <div v-if="subscription.quotas.length" class="quota-list">
                   <div v-for="quota in subscription.quotas" :key="quota.label" class="quota-row">
                     <div><span>{{ quota.label }}</span><strong>剩余 ${{ formatMoney(quota.remaining) }}</strong></div>
@@ -597,16 +624,17 @@ onBeforeUnmount(() => {
           </section>
 
           <section class="token-trend-section">
-            <div class="section-title"><div><strong>Token 使用趋势</strong><span>最近 7 天总 Token</span></div><small>{{ formatTokens(tokenTrendChart.max) }} 峰值</small></div>
-            <div v-if="tokenTrendChart.coordinates.length" class="token-chart">
-              <svg viewBox="0 0 300 88" preserveAspectRatio="none" role="img" aria-label="Token 使用趋势">
-                <defs><linearGradient id="tokenArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#82a89a" stop-opacity=".28"/><stop offset="1" stop-color="#82a89a" stop-opacity="0"/></linearGradient></defs>
-                <line x1="0" y1="18" x2="300" y2="18"/><line x1="0" y1="48" x2="300" y2="48"/><line x1="0" y1="78" x2="300" y2="78"/>
-                <polygon :points="tokenTrendChart.area" fill="url(#tokenArea)" class="token-area"/>
-                <polyline :points="tokenTrendChart.line" class="token-line"/>
-                <circle v-for="point in tokenTrendChart.coordinates" :key="point.index" :cx="point.x" :cy="point.y" r="2.4"><title>{{ point.label }} · {{ formatTokens(point.tokens) }}</title></circle>
+            <div class="section-title"><div><strong>Token 使用趋势</strong><span>最近 7 天 · 左侧 Token / 右侧命中率</span></div><small>{{ formatTokens(tokenSeriesChart.max) }} 峰值</small></div>
+            <div class="token-legend"><span v-for="series in tokenSeriesChart.series" :key="series.key"><i :class="series.key"></i>{{ series.label }}</span></div>
+            <div v-if="tokenSeriesChart.labels.length" class="token-chart multi">
+              <div class="chart-axis left"><span>{{ formatTokens(tokenSeriesChart.max) }}</span><span>{{ formatTokens(tokenSeriesChart.max / 2) }}</span><span>0</span></div>
+              <div class="chart-axis right"><span>100%</span><span>50%</span><span>0%</span></div>
+              <svg viewBox="0 0 300 88" preserveAspectRatio="none" role="img" aria-label="Token 多指标使用趋势">
+                <line x1="0" y1="12" x2="300" y2="12"/><line x1="0" y1="45" x2="300" y2="45"/><line x1="0" y1="78" x2="300" y2="78"/>
+                <polyline v-for="series in tokenSeriesChart.series" :key="series.key" :points="series.line" :class="['metric-line', series.key]"/>
+                <template v-for="series in tokenSeriesChart.series" :key="`${series.key}-points`"><circle v-for="(point, index) in series.coordinates" :key="index" :cx="point.x" :cy="point.y" r="1.8" :class="['metric-point', series.key]"><title>{{ series.label }} · {{ point.label }} · {{ series.percent ? `${point.value.toFixed(1)}%` : formatTokens(point.value) }}</title></circle></template>
               </svg>
-              <div class="token-chart-labels"><span v-for="point in tokenTrendChart.coordinates" :key="point.index">{{ point.label }}</span></div>
+              <div class="token-chart-labels"><span v-for="label in tokenSeriesChart.labels" :key="label">{{ label }}</span></div>
             </div>
             <div v-else class="token-chart-empty">暂无 Token 趋势数据</div>
           </section>
