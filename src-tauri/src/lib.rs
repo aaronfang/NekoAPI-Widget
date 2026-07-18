@@ -2,20 +2,29 @@ use keyring::Entry;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager,
+    Emitter, Manager, PhysicalPosition, Rect,
 };
 
 const API_BASE: &str = "https://999555999.com/api/v1";
 const KEYRING_SERVICE: &str = "com.nekoapi.widget";
 const KEYRING_USER: &str = "session";
+const TRAY_ID: &str = "nekoapi-status";
 
 #[derive(Clone)]
 struct ApiState {
     client: Client,
+}
+
+#[derive(Default)]
+struct PopupState {
+    last_blur: Mutex<Option<Instant>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,8 +290,61 @@ async fn fetch_dashboard_data(
     ))
 }
 
+fn json_number(value: &Value, key: &str) -> f64 {
+    value
+        .get(key)
+        .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()))
+        .unwrap_or_default()
+}
+
+fn compact_tokens(value: f64) -> String {
+    if value >= 1_000_000.0 {
+        let digits = if value >= 10_000_000.0 { 1 } else { 2 };
+        format!("{:.*}M", digits, value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.1}K", value / 1_000.0)
+    } else {
+        format!("{value:.0}")
+    }
+}
+
+fn update_tray_summary(app: &tauri::AppHandle, stats: &Value, subscriptions: &Value) {
+    let today_tokens = json_number(stats, "today_tokens");
+    let monthly = subscriptions.as_array().and_then(|items| {
+        items.iter().find_map(|subscription| {
+            let group = subscription.get("group")?;
+            let limit = json_number(group, "monthly_limit_usd");
+            (limit > 0.0).then(|| {
+                let used = json_number(subscription, "monthly_usage_usd");
+                (used, limit, (used / limit * 100.0).clamp(0.0, 999.0))
+            })
+        })
+    });
+
+    let token_label = compact_tokens(today_tokens);
+    let (title, tooltip) = if let Some((used, limit, percent)) = monthly {
+        (
+            format!("{token_label} · ${used:.2} · {percent:.0}%"),
+            format!("今日 Token {token_label} · 月额度 ${used:.2} / ${limit:.2}（{percent:.1}%）"),
+        )
+    } else {
+        (
+            format!("{token_label} · --%"),
+            format!("今日 Token {token_label} · 未检测到月度额度"),
+        )
+    };
+
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_title(Some(title));
+        let _ = tray.set_tooltip(Some(tooltip));
+    }
+}
+
 #[tauri::command]
-async fn fetch_dashboard(state: tauri::State<'_, ApiState>) -> Result<DashboardSnapshot, String> {
+async fn fetch_dashboard(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ApiState>,
+) -> Result<DashboardSnapshot, String> {
     let mut session = load_session()?.ok_or_else(|| "请先登录".to_string())?;
     let data = match fetch_dashboard_data(&state.client, &session.access_token).await {
         Ok(data) => data,
@@ -311,6 +373,7 @@ async fn fetch_dashboard(state: tauri::State<'_, ApiState>) -> Result<DashboardS
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    update_tray_summary(&app, &data.1, &data.2);
     Ok(DashboardSnapshot {
         profile: data.0,
         stats: data.1,
@@ -383,20 +446,71 @@ async fn fetch_usage_records(state: tauri::State<'_, ApiState>) -> Result<Value,
 }
 
 #[tauri::command]
-fn has_session() -> Result<bool, String> {
-    Ok(load_session()?.is_some())
+fn has_session(app: tauri::AppHandle) -> Result<bool, String> {
+    let has_session = load_session()?.is_some();
+    if !has_session {
+        if let Some(tray) = app.tray_by_id(TRAY_ID) {
+            let _ = tray.set_title(Some("未登录"));
+            let _ = tray.set_tooltip(Some("NekoAPI Widget · 未登录"));
+        }
+    }
+    Ok(has_session)
 }
 
 #[tauri::command]
-fn logout() -> Result<(), String> {
-    delete_session()
+fn logout(app: tauri::AppHandle) -> Result<(), String> {
+    delete_session()?;
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_title(Some("未登录"));
+        let _ = tray.set_tooltip(Some("NekoAPI Widget · 未登录"));
+    }
+    Ok(())
 }
 
-fn toggle_main_window(app: &tauri::AppHandle) {
+fn position_bubble(window: &tauri::WebviewWindow, rect: Rect) {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let tray_position = rect.position.to_physical::<f64>(scale);
+    let tray_size = rect.size.to_physical::<f64>(scale);
+    let window_size = match window.outer_size() {
+        Ok(size) => size,
+        Err(_) => return,
+    };
+    let anchor_x = tray_position.x + tray_size.width / 2.0;
+    let anchor_y = tray_position.y + tray_size.height;
+    let mut x = anchor_x - window_size.width as f64 / 2.0;
+    let mut y = anchor_y + 4.0;
+
+    if let Ok(Some(monitor)) = window.monitor_from_point(anchor_x, anchor_y) {
+        let work = monitor.work_area();
+        let min_x = work.position.x as f64 + 6.0;
+        let max_x =
+            (work.position.x as f64 + work.size.width as f64 - window_size.width as f64 - 6.0)
+                .max(min_x);
+        x = x.clamp(min_x, max_x);
+        y = y.max(work.position.y as f64 + 2.0);
+    }
+
+    let _ = window.set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32));
+}
+
+fn toggle_main_window(app: &tauri::AppHandle, tray_rect: Option<Rect>) {
     if let Some(window) = app.get_webview_window("main") {
         if window.is_visible().unwrap_or(false) {
             let _ = window.hide();
         } else {
+            let blurred_while_clicking_tray = app
+                .state::<PopupState>()
+                .last_blur
+                .lock()
+                .ok()
+                .and_then(|last_blur| *last_blur)
+                .is_some_and(|instant| instant.elapsed() < Duration::from_millis(250));
+            if tray_rect.is_some() && blurred_while_clicking_tray {
+                return;
+            }
+            if let Some(rect) = tray_rect {
+                position_bubble(&window, rect);
+            }
             let _ = window.show();
             let _ = window.set_focus();
         }
@@ -407,12 +521,13 @@ fn toggle_main_window(app: &tauri::AppHandle) {
 pub fn run() {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(20))
-        .user_agent("NekoAPI-Widget/0.2 (+low-frequency account monitor)")
+        .user_agent("NekoAPI-Widget/0.3 (+low-frequency account monitor)")
         .build()
         .expect("failed to build HTTP client");
 
     tauri::Builder::default()
         .manage(ApiState { client })
+        .manage(PopupState::default())
         .invoke_handler(tauri::generate_handler![
             login,
             login_two_factor,
@@ -423,6 +538,9 @@ pub fn run() {
             logout
         ])
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -440,13 +558,14 @@ pub fn run() {
                 .cloned()
                 .ok_or("missing application icon")?;
 
-            TrayIconBuilder::new()
+            TrayIconBuilder::with_id(TRAY_ID)
                 .icon(icon)
+                .title("-- · --%")
                 .tooltip("NekoAPI Widget")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "toggle" => toggle_main_window(app),
+                    "toggle" => toggle_main_window(app, None),
                     "refresh" => {
                         let _ = app.emit("refresh-requested", ());
                     }
@@ -455,22 +574,32 @@ pub fn run() {
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
+                        rect,
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
                         ..
                     } = event
                     {
-                        toggle_main_window(tray.app_handle());
+                        toggle_main_window(tray.app_handle(), Some(rect));
                     }
                 })
                 .build(app)?;
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
             }
+            tauri::WindowEvent::Focused(false) => {
+                if let Ok(mut last_blur) =
+                    window.app_handle().state::<PopupState>().last_blur.lock()
+                {
+                    *last_blur = Some(Instant::now());
+                }
+                let _ = window.hide();
+            }
+            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("error while running NekoAPI Widget");

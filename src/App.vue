@@ -67,10 +67,13 @@ const previewSnapshot: DashboardSnapshot = {
   fetched_at: Math.floor(Date.now() / 1000),
 }
 const previewTrend = { trend: [
-  { date: '2026-07-12', actual_cost: 1.2 }, { date: '2026-07-13', actual_cost: 2.9 },
-  { date: '2026-07-14', actual_cost: .8 }, { date: '2026-07-15', actual_cost: 5.7 },
-  { date: '2026-07-16', actual_cost: 3.4 }, { date: '2026-07-17', actual_cost: 4.9 },
-  { date: '2026-07-18', actual_cost: 3.284 },
+  { date: '2026-07-12', actual_cost: 1.2, input_tokens: 920_000, output_tokens: 180_000 },
+  { date: '2026-07-13', actual_cost: 2.9, input_tokens: 2_140_000, output_tokens: 390_000 },
+  { date: '2026-07-14', actual_cost: .8, input_tokens: 640_000, output_tokens: 130_000 },
+  { date: '2026-07-15', actual_cost: 5.7, input_tokens: 4_320_000, output_tokens: 840_000 },
+  { date: '2026-07-16', actual_cost: 3.4, input_tokens: 2_650_000, output_tokens: 460_000 },
+  { date: '2026-07-17', actual_cost: 4.9, input_tokens: 3_770_000, output_tokens: 710_000 },
+  { date: '2026-07-18', actual_cost: 3.284, input_tokens: 361_200, output_tokens: 67_400 },
 ] }
 const previewRecords = { items: Array.from({ length: 11 }, (_, index) => ({
   id: index + 1,
@@ -235,7 +238,9 @@ const trendPoints = computed(() => {
     return {
       label: shortDate(String(row.date ?? row.day ?? row.period ?? row.time ?? '')),
       value: Number(row.actual_cost ?? row.cost ?? row.total_actual_cost ?? 0),
-      tokens: Number(row.total_tokens ?? row.tokens ?? 0),
+      tokens: Number(row.total_tokens ?? row.tokens ?? 0)
+        || Number(row.input_tokens ?? 0) + Number(row.output_tokens ?? 0)
+        + Number(row.cache_read_tokens ?? 0) + Number(row.cache_creation_tokens ?? 0),
       index,
     }
   })
@@ -244,6 +249,21 @@ const trendPoints = computed(() => {
 })
 
 const sevenDayCost = computed(() => trendPoints.value.reduce((sum, point) => sum + point.value, 0))
+const tokenTrendChart = computed(() => {
+  const points = trendPoints.value
+  const max = Math.max(...points.map(point => point.tokens), 0)
+  const coordinates = points.map((point, index) => {
+    const x = points.length <= 1 ? 150 : index / (points.length - 1) * 300
+    const y = max > 0 ? 76 - point.tokens / max * 62 : 76
+    return { ...point, x, y }
+  })
+  return {
+    coordinates,
+    line: coordinates.map(point => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' '),
+    area: coordinates.length ? `0,82 ${coordinates.map(point => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ')} 300,82` : '',
+    max,
+  }
+})
 
 const usageRecords = computed<UsageRecord[]>(() => {
   return arrayFrom(recordsPayload.value, [['items'], ['records']]).map((item, index) => {
@@ -272,8 +292,13 @@ function formatMoney(value: number, digits = 2): string {
   return new Intl.NumberFormat('zh-CN', { minimumFractionDigits: digits, maximumFractionDigits: 4 }).format(value)
 }
 
-function formatCompact(value: number): string {
-  return new Intl.NumberFormat('zh-CN', { notation: value >= 10_000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(value)
+function formatTokens(value: number): string {
+  if (value >= 1_000_000) {
+    const digits = value >= 10_000_000 ? 1 : 2
+    return `${(value / 1_000_000).toFixed(digits).replace(/\.?0+$/, '')}M`
+  }
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1).replace(/\.0$/, '')}K`
+  return Math.round(value).toLocaleString('en-US')
 }
 
 function formatTime(timestamp?: number): string {
@@ -523,18 +548,10 @@ onBeforeUnmount(() => {
     </section>
 
     <section v-else class="widget-view">
-      <header class="utility-bar">
-        <div class="utility-brand"><div class="brand-mark compact">N</div><div><strong>NekoAPI</strong><span>{{ displayName }}</span></div></div>
-        <div class="balance-pill"><span>余额</span><strong>${{ formatMoney(balance) }}</strong></div>
-        <div class="utility-actions">
-          <button class="round-button" :class="{ rotating: loading }" title="刷新" @click="refreshData(true)"><svg viewBox="0 0 24 24"><path d="M20 6v5h-5M4 18v-5h5M6.1 9a7 7 0 0 1 11.5-2.6L20 8.5M4 15.5l2.4 2.1A7 7 0 0 0 17.9 15"/></svg></button>
-          <button class="round-button" title="设置" @click="settingsOpen = !settingsOpen"><svg viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg></button>
-        </div>
-      </header>
-
       <div class="panel-shell">
         <div class="panel-pointer"></div>
         <nav class="segmented"><button :class="{ active: activeTab === 'overview' }" @click="selectTab('overview')">概览</button><button :class="{ active: activeTab === 'records' }" @click="selectTab('records')">记录</button></nav>
+        <button class="panel-refresh round-button" :class="{ rotating: loading }" title="刷新" @click="refreshData(true)"><svg viewBox="0 0 24 24"><path d="M20 6v5h-5M4 18v-5h5M6.1 9a7 7 0 0 1 11.5-2.6L20 8.5M4 15.5l2.4 2.1A7 7 0 0 0 17.9 15"/></svg></button>
 
         <div v-if="settingsOpen" class="settings-popover">
           <div><strong>自动刷新</strong><span>常规同步仅 3 个只读请求</span></div>
@@ -544,13 +561,13 @@ onBeforeUnmount(() => {
 
         <div v-if="error || notice" class="toast" :class="{ danger: error }">{{ error || notice }}</div>
 
-        <div class="profile-row"><div><strong>{{ displayName }}</strong><span>{{ primarySubscription?.platform ?? '按量计费账户' }}</span></div><small>更新于 {{ formatTime(snapshot?.fetched_at) }}</small></div>
+        <div class="profile-row"><div><strong>{{ displayName }}</strong><span>{{ primarySubscription?.platform ?? '按量计费账户' }}</span></div><small>余额 ${{ formatMoney(balance) }} · 更新于 {{ formatTime(snapshot?.fetched_at) }}</small></div>
 
         <div v-if="activeTab === 'overview'" class="tab-content overview-content">
           <section class="summary-strip">
             <div><span>今日消费</span><strong>${{ formatMoney(todayCost) }}</strong></div>
             <div><span>7 日成本</span><strong>${{ formatMoney(sevenDayCost) }}</strong></div>
-            <div><span>今日 Token</span><strong>{{ formatCompact(todayTokens) }}</strong></div>
+            <div><span>今日 Token</span><strong>{{ formatTokens(todayTokens) }}</strong></div>
           </section>
 
           <section class="subscription-section">
@@ -579,7 +596,22 @@ onBeforeUnmount(() => {
             </div>
           </section>
 
-          <section class="token-foot"><span>累计 Token <strong>{{ formatCompact(totalTokens) }}</strong></span><span>输入 {{ formatCompact(todayInput) }} · 输出 {{ formatCompact(todayOutput) }}</span><span>累计消费 ${{ formatMoney(totalCost) }}</span></section>
+          <section class="token-trend-section">
+            <div class="section-title"><div><strong>Token 使用趋势</strong><span>最近 7 天总 Token</span></div><small>{{ formatTokens(tokenTrendChart.max) }} 峰值</small></div>
+            <div v-if="tokenTrendChart.coordinates.length" class="token-chart">
+              <svg viewBox="0 0 300 88" preserveAspectRatio="none" role="img" aria-label="Token 使用趋势">
+                <defs><linearGradient id="tokenArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#82a89a" stop-opacity=".28"/><stop offset="1" stop-color="#82a89a" stop-opacity="0"/></linearGradient></defs>
+                <line x1="0" y1="18" x2="300" y2="18"/><line x1="0" y1="48" x2="300" y2="48"/><line x1="0" y1="78" x2="300" y2="78"/>
+                <polygon :points="tokenTrendChart.area" fill="url(#tokenArea)" class="token-area"/>
+                <polyline :points="tokenTrendChart.line" class="token-line"/>
+                <circle v-for="point in tokenTrendChart.coordinates" :key="point.index" :cx="point.x" :cy="point.y" r="2.4"><title>{{ point.label }} · {{ formatTokens(point.tokens) }}</title></circle>
+              </svg>
+              <div class="token-chart-labels"><span v-for="point in tokenTrendChart.coordinates" :key="point.index">{{ point.label }}</span></div>
+            </div>
+            <div v-else class="token-chart-empty">暂无 Token 趋势数据</div>
+          </section>
+
+          <section class="token-foot"><span>累计 Token <strong>{{ formatTokens(totalTokens) }}</strong></span><span>输入 {{ formatTokens(todayInput) }} · 输出 {{ formatTokens(todayOutput) }}</span><span>累计消费 ${{ formatMoney(totalCost) }}</span></section>
         </div>
 
         <div v-else class="tab-content records-content">
@@ -587,13 +619,13 @@ onBeforeUnmount(() => {
           <div v-if="usageRecords.length" class="record-list">
             <article v-for="record in usageRecords" :key="record.id" class="record-item">
               <span class="record-status" :class="{ failed: !record.success }"></span>
-              <div class="record-main"><strong>{{ record.model }}</strong><span>{{ formatCompact(record.tokens) }} tokens · ${{ formatMoney(record.cost, 4) }}</span><small>{{ formatDateTime(record.time) }} · {{ record.source }}</small></div>
+              <div class="record-main"><strong>{{ record.model }}</strong><span>{{ formatTokens(record.tokens) }} tokens · ${{ formatMoney(record.cost, 4) }}</span><small>{{ formatDateTime(record.time) }} · {{ record.source }}</small></div>
             </article>
           </div>
           <div v-else class="records-empty"><span class="spinner" v-if="detailLoading"></span><strong>{{ detailLoading ? '正在读取记录…' : '暂无用量记录' }}</strong><small>应用不会持续轮询明细</small></div>
         </div>
 
-        <footer class="panel-footer"><span class="online-dot" :class="{ stale: error }"></span><span>{{ error ? '使用缓存数据' : '连接正常' }}</span><span class="spacer"></span><span>{{ refreshMinutes }} 分钟刷新</span></footer>
+        <footer class="panel-footer"><span class="online-dot" :class="{ stale: error }"></span><span>{{ error ? '使用缓存数据' : '连接正常' }}</span><span class="spacer"></span><span>{{ refreshMinutes }} 分钟刷新</span><button class="footer-settings" title="设置" @click="settingsOpen = !settingsOpen"><svg viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg></button></footer>
       </div>
     </section>
   </main>

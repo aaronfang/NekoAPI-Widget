@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "NekoAPI Widget",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "identifier": "com.nekoapi.widget",
   "build": {
     "frontendDist": "../dist",
@@ -10,6 +10,7 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "NekoAPI Widget",
@@ -19,6 +20,9 @@
         "minHeight": 620,
         "resizable": false,
         "fullscreen": false,
+        "decorations": false,
+        "transparent": true,
+        "visible": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "center": true
