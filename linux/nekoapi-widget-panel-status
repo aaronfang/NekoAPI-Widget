@@ -1,0 +1,12 @@
+#!/bin/sh
+
+status_file="$HOME/.cache/nekoapi-widget/panel-status"
+toggle_command="$HOME/.local/bin/nekoapi-widget-panel-toggle"
+label=$(cat "$status_file" 2>/dev/null)
+
+[ -n "$label" ] || label='-- · --%'
+printf '%s\n' \
+  '<img>/usr/share/icons/hicolor/32x32/apps/nekoapi-widget.png</img>' \
+  "<txt>$label</txt>" \
+  '<tool>NekoAPI Widget</tool>' \
+  "<click>$toggle_command</click>"

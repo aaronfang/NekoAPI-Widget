@@ -6,6 +6,13 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+#[cfg(target_os = "linux")]
+use std::{
+    fs,
+    io::{BufRead, BufReader, Write},
+    path::PathBuf,
+    thread,
+};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -16,6 +23,13 @@ const API_BASE: &str = "https://999555999.com/api/v1";
 const KEYRING_SERVICE: &str = "com.nekoapi.widget";
 const KEYRING_USER: &str = "session";
 const TRAY_ID: &str = "nekoapi-status";
+
+#[cfg(target_os = "linux")]
+const LINUX_PANEL_DIR: &str = ".cache/nekoapi-widget";
+#[cfg(target_os = "linux")]
+const LINUX_PANEL_STATUS_FILE: &str = "panel-status";
+#[cfg(target_os = "linux")]
+const LINUX_CONTROL_SOCKET: &str = "control.sock";
 
 #[derive(Clone)]
 struct ApiState {
@@ -342,6 +356,13 @@ fn update_tray_summary(app: &tauri::AppHandle, stats: &Value, subscriptions: &Va
         )
     };
 
+    set_status_summary(app, &title, &tooltip);
+}
+
+fn set_status_summary(app: &tauri::AppHandle, title: &str, tooltip: &str) {
+    #[cfg(target_os = "linux")]
+    write_linux_panel_status(title);
+
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_title(Some(title));
         let _ = tray.set_tooltip(Some(tooltip));
@@ -457,10 +478,7 @@ async fn fetch_usage_records(state: tauri::State<'_, ApiState>) -> Result<Value,
 fn has_session(app: tauri::AppHandle) -> Result<bool, String> {
     let has_session = load_session()?.is_some();
     if !has_session {
-        if let Some(tray) = app.tray_by_id(TRAY_ID) {
-            let _ = tray.set_title(Some("未登录"));
-            let _ = tray.set_tooltip(Some("NekoAPI Widget · 未登录"));
-        }
+        set_status_summary(&app, "未登录", "NekoAPI Widget · 未登录");
     }
     Ok(has_session)
 }
@@ -468,11 +486,33 @@ fn has_session(app: tauri::AppHandle) -> Result<bool, String> {
 #[tauri::command]
 fn logout(app: tauri::AppHandle) -> Result<(), String> {
     delete_session()?;
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let _ = tray.set_title(Some("未登录"));
-        let _ = tray.set_tooltip(Some("NekoAPI Widget · 未登录"));
-    }
+    set_status_summary(&app, "未登录", "NekoAPI Widget · 未登录");
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_panel_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(LINUX_PANEL_DIR))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_control_socket_path() -> Option<PathBuf> {
+    linux_panel_dir().map(|path| path.join(LINUX_CONTROL_SOCKET))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_panel_bridge_enabled() -> bool {
+    std::env::var("NEKOAPI_PANEL_BRIDGE").is_ok_and(|value| value == "1")
+}
+
+#[cfg(target_os = "linux")]
+fn write_linux_panel_status(status: &str) {
+    let Some(directory) = linux_panel_dir() else {
+        return;
+    };
+    if fs::create_dir_all(&directory).is_ok() {
+        let _ = fs::write(directory.join(LINUX_PANEL_STATUS_FILE), status);
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -500,6 +540,31 @@ fn position_bubble(window: &tauri::WebviewWindow, rect: Rect) {
     }
 
     let _ = window.set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32));
+}
+
+#[cfg(target_os = "linux")]
+fn position_bubble_at(window: &tauri::WebviewWindow, anchor_x: i32, anchor_y: i32) {
+    // The GTK backend reports a stale physical size while this window is
+    // hidden. These are the fixed logical dimensions from tauri.conf.json.
+    let width = 392;
+    let height = 720;
+    let mut x = anchor_x - width / 2;
+    let mut y = anchor_y + 4;
+
+    if let Ok(Some(monitor)) = window.monitor_from_point(anchor_x as f64, anchor_y as f64) {
+        let work = monitor.work_area();
+        let min_x = work.position.x + 6;
+        let max_x = (work.position.x + work.size.width as i32 - width - 6).max(min_x);
+        let min_y = work.position.y + 2;
+        let max_y = (work.position.y + work.size.height as i32 - height - 6).max(min_y);
+        x = x.clamp(min_x, max_x);
+        if y > max_y {
+            y = anchor_y - height - 4;
+        }
+        y = y.clamp(min_y, max_y);
+    }
+
+    let _ = window.set_position(PhysicalPosition::new(x, y));
 }
 
 #[cfg(target_os = "windows")]
@@ -625,11 +690,138 @@ fn toggle_main_window(app: &tauri::AppHandle, tray_rect: Option<Rect>) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn toggle_main_window_at(app: &tauri::AppHandle, anchor_x: i32, anchor_y: i32) {
+    if let Some(window) = app.get_webview_window("main") {
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+        } else {
+            let blurred_while_clicking_panel = app
+                .state::<PopupState>()
+                .last_blur
+                .lock()
+                .ok()
+                .and_then(|last_blur| *last_blur)
+                .is_some_and(|instant| instant.elapsed() < Duration::from_millis(250));
+            if blurred_while_clicking_panel {
+                return;
+            }
+            position_bubble_at(&window, anchor_x, anchor_y);
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_linux_control_socket(app: tauri::AppHandle) {
+    use std::os::unix::net::UnixListener;
+
+    let Some(path) = linux_control_socket_path() else {
+        return;
+    };
+    let Some(directory) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(directory).is_err() {
+        return;
+    }
+    let _ = fs::remove_file(&path);
+    let Ok(listener) = UnixListener::bind(path) else {
+        return;
+    };
+
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut request = String::new();
+            if BufReader::new(stream).read_line(&mut request).is_err() {
+                continue;
+            }
+            let mut fields = request.split_whitespace();
+            if fields.next() != Some("toggle") {
+                continue;
+            }
+            let (Ok(x), Ok(y)) = (
+                fields.next().unwrap_or_default().parse::<i32>(),
+                fields.next().unwrap_or_default().parse::<i32>(),
+            ) else {
+                continue;
+            };
+            let app = app.clone();
+            let callback_app = app.clone();
+            let _ = app.run_on_main_thread(move || toggle_main_window_at(&callback_app, x, y));
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+pub fn handle_linux_toggle_request() -> bool {
+    use std::os::unix::net::UnixStream;
+
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() != Some("--toggle") {
+        return false;
+    }
+    let (Some(x), Some(y)) = (args.next(), args.next()) else {
+        return true;
+    };
+    if let Some(path) = linux_control_socket_path() {
+        if let Ok(mut stream) = UnixStream::connect(path) {
+            let _ = writeln!(stream, "toggle {x} {y}");
+        }
+    }
+    true
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn handle_linux_toggle_request() -> bool {
+    false
+}
+
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    let toggle = MenuItem::with_id(app, "toggle", "显示 / 隐藏", true, None::<&str>)?;
+    let refresh = MenuItem::with_id(app, "refresh", "刷新数据", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&toggle, &refresh, &quit])?;
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .ok_or(tauri::Error::AssetNotFound("application icon".into()))?;
+
+    TrayIconBuilder::with_id(TRAY_ID)
+        .icon(icon)
+        .title("-- · --%")
+        .tooltip("NekoAPI Widget")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "toggle" => toggle_main_window(app, None),
+            "refresh" => {
+                let _ = app.emit("refresh-requested", ());
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                rect,
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_main_window(tray.app_handle(), Some(rect));
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(20))
-        .user_agent("NekoAPI-Widget/0.4.1 (+low-frequency account monitor)")
+        .user_agent("NekoAPI-Widget/0.4.2 (+low-frequency account monitor)")
         .build()
         .expect("failed to build HTTP client");
 
@@ -657,41 +849,20 @@ pub fn run() {
                 )?;
             }
 
-            let toggle = MenuItem::with_id(app, "toggle", "显示 / 隐藏", true, None::<&str>)?;
-            let refresh = MenuItem::with_id(app, "refresh", "刷新数据", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&toggle, &refresh, &quit])?;
-            let icon = app
-                .default_window_icon()
-                .cloned()
-                .ok_or("missing application icon")?;
+            #[cfg(target_os = "linux")]
+            {
+                if linux_panel_bridge_enabled() {
+                    write_linux_panel_status("-- · --%");
+                    start_linux_control_socket(app.handle().clone());
+                } else {
+                    build_tray(app)?;
+                }
+            }
 
-            TrayIconBuilder::with_id(TRAY_ID)
-                .icon(icon)
-                .title("-- · --%")
-                .tooltip("NekoAPI Widget")
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "toggle" => toggle_main_window(app, None),
-                    "refresh" => {
-                        let _ = app.emit("refresh-requested", ());
-                    }
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        rect,
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        toggle_main_window(tray.app_handle(), Some(rect));
-                    }
-                })
-                .build(app)?;
+            #[cfg(not(target_os = "linux"))]
+            {
+                build_tray(app)?;
+            }
             Ok(())
         })
         .on_window_event(|window, event| match event {

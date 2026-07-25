@@ -1,6 +1,6 @@
 # NekoAPI Widget
 
-一个低负荷的 NekoAPI 桌面用量监视器。应用常驻系统菜单栏，显示今日消费、余额、Token 用量和平台分布。
+一个低负荷的 NekoAPI 桌面用量监视器。应用常驻 macOS 菜单栏或 Windows/Linux 系统面板，显示今日消费、余额、Token 用量和平台分布。
 
 ## 功能
 
@@ -32,7 +32,7 @@ npm run tauri dev
 
 ```bash
 npm run build
-cargo check --manifest-path src-tauri/Cargo.toml
+npm run tauri build
 ```
 
 生成 macOS 应用：
@@ -40,6 +40,20 @@ cargo check --manifest-path src-tauri/Cargo.toml
 ```bash
 npm run tauri build -- --bundles app
 ```
+
+### Linux
+
+Linux 默认使用 AppIndicator/StatusNotifier 系统托盘，可安装发布页提供的 `.deb` 或 `.AppImage`。登录令牌保存在 Secret Service；Debian/Ubuntu 需要可用的 `gnome-keyring` 或兼容服务。
+
+XFCE 内建 systray 不显示 AppIndicator 的动态文字，也不向应用提供主点击事件和图标位置。发布页同时提供 `NekoAPI-Widget-v0.4.2-xfce-panel.tar.gz`，它通过 GenMon 显示 `今日 Token · 订阅已用%`，支持单击直接显示/隐藏，并让面板锚定在点击位置下方：
+
+```bash
+sudo apt install xfce4-genmon-plugin xdotool
+tar -xzf NekoAPI-Widget-v0.4.2-xfce-panel.tar.gz
+./linux/install-xfce-panel.sh
+```
+
+该脚本只修改当前用户的 XFCE 面板和自启动配置。未启用 XFCE 桥接时，应用继续使用标准 Linux 托盘菜单。
 
 ### Windows
 
@@ -53,11 +67,22 @@ npm run tauri dev
 npm run tauri build -- --bundles nsis
 ```
 
-仓库中的 `Build Windows` GitHub Actions 工作流会在原生 `windows-latest` 环境执行前端检查、Rust Windows 目标检查和 NSIS 打包，并上传可下载的 `.exe` artifact。
+仓库中的 `Build Windows` 工作流提供手动 NSIS 构建；版本标签由统一的 `Release` 工作流在原生 Windows、macOS 和 Linux runner 上构建并发布。
 
 > Windows 系统托盘不支持 macOS 式的常驻文字标题，因此今日 Token 和订阅百分比显示在托盘提示中；点击托盘图标仍会显示同一套锚定气泡界面。
 
 Windows 气泡会检测任务栏所在边缘：底部任务栏向上展开，顶部向下展开，左右侧任务栏向屏幕内部展开，并始终限制在当前显示器工作区内。macOS 继续使用顶部菜单栏下方展开逻辑。
+
+## 发布包
+
+推送 `v*` 标签后，`Release` 工作流仅在三个系统全部构建成功时创建 GitHub Release：
+
+- Windows x64 NSIS 安装程序（`.exe`）
+- macOS Intel/Apple Silicon 通用磁盘映像（`.dmg`）
+- Linux x64 Debian 包和 AppImage（`.deb` / `.AppImage`）
+- XFCE 面板集成脚本（`.tar.gz`）
+
+当前发布包未进行 Apple Developer ID 或 Windows Authenticode 签名，系统可能显示来源确认提示。
 
 ## 请求策略
 

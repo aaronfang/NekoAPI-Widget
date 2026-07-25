@@ -1,6 +1,6 @@
 [package]
 name = "nekoapi-widget"
-version = "0.4.1"
+version = "0.4.2"
 description = "A low-impact desktop usage monitor for NekoAPI"
 authors = ["NekoAPI Widget contributors"]
 license = "MIT"
