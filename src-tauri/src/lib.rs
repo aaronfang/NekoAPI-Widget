@@ -2,10 +2,6 @@ use keyring::Entry;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{
-    sync::Mutex,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
 #[cfg(target_os = "linux")]
 use std::{
     fs,
@@ -13,7 +9,12 @@ use std::{
     path::PathBuf,
     thread,
 };
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use tauri::{
+    image::Image,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, PhysicalPosition, Rect,
@@ -59,8 +60,93 @@ struct DashboardSnapshot {
     profile: Value,
     stats: Value,
     subscriptions: Value,
+    subscription_summary: SubscriptionSummary,
     subscriptions_error: Option<String>,
+    channel_monitors: Value,
+    channel_monitors_error: Option<String>,
     fetched_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum QuotaPeriod {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl QuotaPeriod {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Daily => "日额度",
+            Self::Weekly => "周额度",
+            Self::Monthly => "月额度",
+        }
+    }
+
+    fn tie_break_priority(&self) -> u8 {
+        match self {
+            Self::Daily => 0,
+            Self::Weekly => 1,
+            Self::Monthly => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QuotaSummaryItem {
+    subscription_id: String,
+    subscription_name: String,
+    platform: String,
+    period: QuotaPeriod,
+    used: f64,
+    limit: f64,
+    percent: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct SubscriptionSummary {
+    active_subscription_count: usize,
+    quota_count: usize,
+    selected: Option<QuotaSummaryItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelLightState {
+    Operational,
+    Degraded,
+    Failed,
+    Unknown,
+}
+
+impl ChannelLightState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Operational => "正常",
+            Self::Degraded => "性能下降",
+            Self::Failed => "故障",
+            Self::Unknown => "未知",
+        }
+    }
+
+    fn severity(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::Operational => 1,
+            Self::Degraded => 2,
+            Self::Failed => 3,
+        }
+    }
+
+    fn color(self) -> [u8; 4] {
+        match self {
+            // Match the muted status palette used by `.channel-dot` in the UI.
+            Self::Operational => [130, 168, 154, 255],
+            Self::Degraded => [180, 154, 114, 255],
+            Self::Failed => [185, 120, 126, 255],
+            Self::Unknown => [83, 90, 101, 255],
+        }
+    }
 }
 
 fn session_entry() -> Result<Entry, String> {
@@ -255,19 +341,22 @@ async fn get_authorized(
 async fn fetch_dashboard_data(
     client: &Client,
     token: &str,
-) -> Result<(Value, Value, Value, Option<String>), String> {
-    let (profile_result, stats_result, subscriptions_result) = tokio::join!(
+) -> Result<(Value, Value, Value, Option<String>, Value, Option<String>), String> {
+    let (profile_result, stats_result, subscriptions_result, channel_monitors_result) = tokio::join!(
         get_authorized(client, "/user/profile", token),
         get_authorized(client, "/usage/dashboard/stats", token),
-        get_authorized(client, "/subscriptions/active", token)
+        get_authorized(client, "/subscriptions/active", token),
+        get_authorized(client, "/channel-monitors", token)
     );
     let (profile_status, profile) = profile_result?;
     let (stats_status, stats) = stats_result?;
     let (subscriptions_status, subscriptions) = subscriptions_result?;
+    let (channel_monitors_status, channel_monitors) = channel_monitors_result?;
 
     if profile_status == StatusCode::UNAUTHORIZED
         || stats_status == StatusCode::UNAUTHORIZED
         || subscriptions_status == StatusCode::UNAUTHORIZED
+        || channel_monitors_status == StatusCode::UNAUTHORIZED
     {
         return Err("__SESSION_EXPIRED__".to_string());
     }
@@ -295,12 +384,25 @@ async fn fetch_dashboard_data(
             )),
         )
     };
+    let (channel_monitors, channel_monitors_error) = if channel_monitors_status.is_success() {
+        (unwrap_payload(channel_monitors)?, None)
+    } else {
+        (
+            Value::Array(Vec::new()),
+            Some(api_error(
+                &channel_monitors,
+                &format!("渠道状态请求失败（HTTP {channel_monitors_status}）"),
+            )),
+        )
+    };
 
     Ok((
         unwrap_payload(profile)?,
         unwrap_payload(stats)?,
         subscriptions,
         subscriptions_error,
+        channel_monitors,
+        channel_monitors_error,
     ))
 }
 
@@ -322,50 +424,403 @@ fn compact_tokens(value: f64) -> String {
     }
 }
 
-fn update_tray_summary(app: &tauri::AppHandle, stats: &Value, subscriptions: &Value) {
-    let today_tokens = json_number(stats, "today_tokens");
-    let quota = subscriptions.as_array().and_then(|items| {
-        [
-            ("monthly_limit_usd", "monthly_usage_usd", "月额度"),
-            ("weekly_limit_usd", "weekly_usage_usd", "周额度"),
-            ("daily_limit_usd", "daily_usage_usd", "日额度"),
-        ]
-        .into_iter()
-        .find_map(|(limit_key, usage_key, label)| {
-            items.iter().find_map(|subscription| {
-                let group = subscription.get("group")?;
-                let limit = json_number(group, limit_key);
-                (limit > 0.0).then(|| {
-                    let used = json_number(subscription, usage_key);
-                    (used, limit, (used / limit * 100.0).clamp(0.0, 999.0), label)
-                })
-            })
+fn subscription_items(subscriptions: &Value) -> &[Value] {
+    subscriptions
+        .as_array()
+        .or_else(|| subscriptions.get("items").and_then(Value::as_array))
+        .or_else(|| subscriptions.get("subscriptions").and_then(Value::as_array))
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+fn string_value(value: Option<&Value>, fallback: &str) -> String {
+    value
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .or_else(|| value.as_i64().map(|number| number.to_string()))
+                .or_else(|| value.as_u64().map(|number| number.to_string()))
         })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn subscription_summary(subscriptions: &Value) -> SubscriptionSummary {
+    let mut candidates = Vec::new();
+    let mut active_subscription_count = 0;
+
+    for (index, subscription) in subscription_items(subscriptions).iter().enumerate() {
+        let status = subscription
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("active");
+        if status != "active" {
+            continue;
+        }
+        active_subscription_count += 1;
+
+        let group = subscription.get("group").unwrap_or(&Value::Null);
+        let subscription_id = string_value(subscription.get("id"), &index.to_string());
+        let subscription_name = string_value(
+            group.get("name").or_else(|| subscription.get("name")),
+            "订阅套餐",
+        );
+        let platform = string_value(
+            group
+                .get("platform")
+                .or_else(|| subscription.get("platform")),
+            "subscription",
+        );
+
+        for (period, limit_key, usage_key) in [
+            (QuotaPeriod::Daily, "daily_limit_usd", "daily_usage_usd"),
+            (QuotaPeriod::Weekly, "weekly_limit_usd", "weekly_usage_usd"),
+            (
+                QuotaPeriod::Monthly,
+                "monthly_limit_usd",
+                "monthly_usage_usd",
+            ),
+        ] {
+            let limit = json_number(group, limit_key);
+            if !limit.is_finite() || limit <= 0.0 {
+                continue;
+            }
+            let used = json_number(subscription, usage_key).max(0.0);
+            candidates.push(QuotaSummaryItem {
+                subscription_id: subscription_id.clone(),
+                subscription_name: subscription_name.clone(),
+                platform: platform.clone(),
+                period,
+                used,
+                limit,
+                // Preserve over-quota values for truthful labels. Only visual
+                // progress bars should clamp their width to 100%.
+                percent: used / limit * 100.0,
+            });
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .percent
+            .total_cmp(&left.percent)
+            .then_with(|| {
+                left.period
+                    .tie_break_priority()
+                    .cmp(&right.period.tie_break_priority())
+            })
+            .then_with(|| left.subscription_id.cmp(&right.subscription_id))
     });
 
+    SubscriptionSummary {
+        active_subscription_count,
+        quota_count: candidates.len(),
+        selected: candidates.into_iter().next(),
+    }
+}
+
+fn channel_light_state(channel_monitors: &Value, platform: Option<&str>) -> ChannelLightState {
+    let normalized_platform = platform.map(str::to_ascii_lowercase);
+    subscription_items(channel_monitors)
+        .iter()
+        .filter(|monitor| {
+            let Some(platform) = normalized_platform.as_ref() else {
+                return true;
+            };
+            monitor
+                .get("provider")
+                .or_else(|| monitor.get("platform"))
+                .and_then(Value::as_str)
+                .is_some_and(|provider| provider.eq_ignore_ascii_case(platform))
+        })
+        .map(|monitor| {
+            match monitor
+                .get("primary_status")
+                .or_else(|| monitor.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+            {
+                "operational" => ChannelLightState::Operational,
+                "degraded" => ChannelLightState::Degraded,
+                "failed" | "error" => ChannelLightState::Failed,
+                _ => ChannelLightState::Unknown,
+            }
+        })
+        .max_by_key(|state| state.severity())
+        .unwrap_or(ChannelLightState::Unknown)
+}
+
+fn status_light_icon(state: ChannelLightState) -> Image<'static> {
+    const SIZE: u32 = 32;
+    const CENTER: f32 = (SIZE as f32 - 1.0) / 2.0;
+    let mut rgba = vec![0; (SIZE * SIZE * 4) as usize];
+    let fill = state.color();
+
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let dx = x as f32 - CENTER;
+            let dy = y as f32 - CENTER;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let pixel = ((y * SIZE + x) * 4) as usize;
+            // The UI uses a small flat dot with a subtle same-color glow.
+            // Render the same shape at tray resolution without the previous
+            // white ring, which looked like a generic traffic light.
+            let color = if distance <= 6.5 {
+                fill
+            } else if distance <= 10.5 {
+                let fade = ((10.5 - distance) / 4.0).clamp(0.0, 1.0);
+                [
+                    fill[0],
+                    fill[1],
+                    fill[2],
+                    (55.0 * fade * fade).round() as u8,
+                ]
+            } else {
+                [0, 0, 0, 0]
+            };
+            rgba[pixel..pixel + 4].copy_from_slice(&color);
+        }
+    }
+
+    Image::new_owned(rgba, SIZE, SIZE)
+}
+
+fn update_tray_summary(
+    app: &tauri::AppHandle,
+    stats: &Value,
+    summary: &SubscriptionSummary,
+    channel_monitors: &Value,
+) {
+    let today_tokens = json_number(stats, "today_tokens");
     let token_label = compact_tokens(today_tokens);
-    let (title, tooltip) = if let Some((used, limit, percent, label)) = quota {
+    // Keep the light and percentage about the same subscription. If there is
+    // no quota-selected subscription, fall back to the worst published status.
+    let channel_state = channel_light_state(
+        channel_monitors,
+        summary
+            .selected
+            .as_ref()
+            .map(|quota| quota.platform.as_str()),
+    );
+    let (title, tooltip) = if let Some(quota) = &summary.selected {
+        let extra_subscriptions = summary.active_subscription_count.saturating_sub(1);
+        let extra_label = if extra_subscriptions > 0 {
+            format!("\n另有 {extra_subscriptions} 个有效订阅")
+        } else {
+            String::new()
+        };
         (
-            format!("{token_label} · {percent:.0}%"),
-            format!("今日 Token {token_label} · {label} ${used:.2} / ${limit:.2}（{percent:.1}%）"),
+            format!("{token_label} · {:.0}%", quota.percent),
+            format!(
+                "渠道状态：{}\n今日 Token {token_label}\n最高占用：{} · {}\n${:.2} / ${:.2}（{:.1}%）{}",
+                channel_state.label(),
+                quota.subscription_name,
+                quota.period.label(),
+                quota.used,
+                quota.limit,
+                quota.percent,
+                extra_label
+            ),
         )
     } else {
         (
             format!("{token_label} · --%"),
-            format!("今日 Token {token_label} · 未检测到订阅额度"),
+            format!(
+                "渠道状态：{}\n今日 Token {token_label}\n未检测到有效订阅额度（{} 个有效订阅）",
+                channel_state.label(),
+                summary.active_subscription_count,
+            ),
         )
     };
 
-    set_status_summary(app, &title, &tooltip);
+    set_status_summary(app, &title, &tooltip, channel_state);
 }
 
-fn set_status_summary(app: &tauri::AppHandle, title: &str, tooltip: &str) {
+fn set_status_summary(
+    app: &tauri::AppHandle,
+    title: &str,
+    tooltip: &str,
+    channel_state: ChannelLightState,
+) {
     #[cfg(target_os = "linux")]
     write_linux_panel_status(title);
 
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_icon_with_as_template(Some(status_light_icon(channel_state)), false);
         let _ = tray.set_title(Some(title));
         let _ = tray.set_tooltip(Some(tooltip));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_highest_usage_across_subscriptions_and_periods() {
+        let subscriptions = json!([
+            {
+                "id": 1,
+                "status": "active",
+                "daily_usage_usd": 9,
+                "weekly_usage_usd": 20,
+                "group": {
+                    "name": "Claude",
+                    "platform": "anthropic",
+                    "daily_limit_usd": 10,
+                    "weekly_limit_usd": 50
+                }
+            },
+            {
+                "id": 2,
+                "status": "active",
+                "monthly_usage_usd": 12,
+                "group": {
+                    "name": "OpenAI",
+                    "platform": "openai",
+                    "monthly_limit_usd": 100
+                }
+            }
+        ]);
+
+        let summary = subscription_summary(&subscriptions);
+        let selected = summary.selected.expect("a quota should be selected");
+
+        assert_eq!(summary.active_subscription_count, 2);
+        assert_eq!(summary.quota_count, 3);
+        assert_eq!(selected.subscription_name, "Claude");
+        assert_eq!(selected.period, QuotaPeriod::Daily);
+        assert_eq!(selected.percent, 90.0);
+    }
+
+    #[test]
+    fn prefers_shorter_period_when_percentages_are_equal() {
+        let subscriptions = json!([{
+            "id": 1,
+            "status": "active",
+            "daily_usage_usd": 5,
+            "monthly_usage_usd": 50,
+            "group": {
+                "name": "Equal Quotas",
+                "daily_limit_usd": 10,
+                "monthly_limit_usd": 100
+            }
+        }]);
+
+        let selected = subscription_summary(&subscriptions)
+            .selected
+            .expect("a quota should be selected");
+
+        assert_eq!(selected.period, QuotaPeriod::Daily);
+    }
+
+    #[test]
+    fn preserves_over_quota_percentage() {
+        let subscriptions = json!([{
+            "id": 1,
+            "status": "active",
+            "daily_usage_usd": 12.5,
+            "group": {
+                "daily_limit_usd": 10
+            }
+        }]);
+
+        let selected = subscription_summary(&subscriptions)
+            .selected
+            .expect("a quota should be selected");
+
+        assert_eq!(selected.percent, 125.0);
+    }
+
+    #[test]
+    fn ignores_inactive_subscriptions_and_zero_limits() {
+        let subscriptions = json!([
+            {
+                "id": 1,
+                "status": "expired",
+                "daily_usage_usd": 10,
+                "group": { "daily_limit_usd": 10 }
+            },
+            {
+                "id": 2,
+                "status": "active",
+                "daily_usage_usd": 1,
+                "group": { "daily_limit_usd": 0 }
+            }
+        ]);
+
+        let summary = subscription_summary(&subscriptions);
+
+        assert_eq!(summary.active_subscription_count, 1);
+        assert_eq!(summary.quota_count, 0);
+        assert!(summary.selected.is_none());
+    }
+
+    #[test]
+    fn accepts_wrapped_subscription_arrays() {
+        let subscriptions = json!({
+            "items": [{
+                "id": "wrapped",
+                "status": "active",
+                "monthly_usage_usd": "25",
+                "group": {
+                    "name": "Wrapped",
+                    "monthly_limit_usd": "100"
+                }
+            }]
+        });
+
+        let selected = subscription_summary(&subscriptions)
+            .selected
+            .expect("a quota should be selected");
+
+        assert_eq!(selected.subscription_id, "wrapped");
+        assert_eq!(selected.percent, 25.0);
+    }
+
+    #[test]
+    fn selects_the_worst_status_for_the_active_subscription_platform() {
+        let monitors = json!({
+            "items": [
+                { "provider": "anthropic", "primary_status": "operational" },
+                { "provider": "openai", "primary_status": "operational" },
+                { "provider": "anthropic", "primary_status": "degraded" },
+                { "provider": "gemini", "primary_status": "failed" }
+            ]
+        });
+
+        assert_eq!(
+            channel_light_state(&monitors, Some("anthropic")),
+            ChannelLightState::Degraded
+        );
+        assert_eq!(
+            channel_light_state(&monitors, Some("openai")),
+            ChannelLightState::Operational
+        );
+    }
+
+    #[test]
+    fn falls_back_to_worst_published_status_without_selected_subscription() {
+        let monitors = json!([
+            { "provider": "anthropic", "primary_status": "operational" },
+            { "provider": "openai", "primary_status": "error" }
+        ]);
+
+        assert_eq!(
+            channel_light_state(&monitors, None),
+            ChannelLightState::Failed
+        );
+    }
+
+    #[test]
+    fn status_light_icon_has_expected_dimensions_and_center_color() {
+        let icon = status_light_icon(ChannelLightState::Operational);
+        let debug = format!("{icon:?}");
+
+        assert!(debug.contains("width: 32"));
+        assert!(debug.contains("height: 32"));
+        assert!(debug.contains("4096"));
     }
 }
 
@@ -402,12 +857,16 @@ async fn fetch_dashboard(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    update_tray_summary(&app, &data.1, &data.2);
+    let subscription_summary = subscription_summary(&data.2);
+    update_tray_summary(&app, &data.1, &subscription_summary, &data.4);
     Ok(DashboardSnapshot {
         profile: data.0,
         stats: data.1,
         subscriptions: data.2,
+        subscription_summary,
         subscriptions_error: data.3,
+        channel_monitors: data.4,
+        channel_monitors_error: data.5,
         fetched_at,
     })
 }
@@ -478,7 +937,12 @@ async fn fetch_usage_records(state: tauri::State<'_, ApiState>) -> Result<Value,
 fn has_session(app: tauri::AppHandle) -> Result<bool, String> {
     let has_session = load_session()?.is_some();
     if !has_session {
-        set_status_summary(&app, "未登录", "NekoAPI Widget · 未登录");
+        set_status_summary(
+            &app,
+            "未登录",
+            "NekoAPI Widget · 未登录",
+            ChannelLightState::Unknown,
+        );
     }
     Ok(has_session)
 }
@@ -486,7 +950,12 @@ fn has_session(app: tauri::AppHandle) -> Result<bool, String> {
 #[tauri::command]
 fn logout(app: tauri::AppHandle) -> Result<(), String> {
     delete_session()?;
-    set_status_summary(&app, "未登录", "NekoAPI Widget · 未登录");
+    set_status_summary(
+        &app,
+        "未登录",
+        "NekoAPI Widget · 未登录",
+        ChannelLightState::Unknown,
+    );
     Ok(())
 }
 
@@ -783,13 +1252,9 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let refresh = MenuItem::with_id(app, "refresh", "刷新数据", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&toggle, &refresh, &quit])?;
-    let icon = app
-        .default_window_icon()
-        .cloned()
-        .ok_or(tauri::Error::AssetNotFound("application icon".into()))?;
-
     TrayIconBuilder::with_id(TRAY_ID)
-        .icon(icon)
+        .icon(status_light_icon(ChannelLightState::Unknown))
+        .icon_as_template(false)
         .title("-- · --%")
         .tooltip("NekoAPI Widget")
         .menu(&menu)
@@ -821,7 +1286,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 pub fn run() {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(20))
-        .user_agent("NekoAPI-Widget/0.4.2 (+low-frequency account monitor)")
+        .user_agent("NekoAPI-Widget/0.5.0 (+low-frequency account monitor)")
         .build()
         .expect("failed to build HTTP client");
 

@@ -32,6 +32,7 @@ interface QuotaRow {
   limit: number
   remaining: number
   percent: number
+  progressPercent: number
   resetAt?: string
 }
 
@@ -52,7 +53,21 @@ interface UsageRecord {
   cost: number
   time?: string
   source: string
+  statusCode?: number
   success: boolean
+}
+
+interface ChannelMonitor {
+  id: string
+  name: string
+  provider: string
+  model: string
+  groupName?: string
+  state: 'operational' | 'degraded' | 'failed' | 'error' | 'unknown'
+  label: string
+  latency?: number
+  pingLatency?: number
+  availability?: number
 }
 
 const previewMode = import.meta.env.DEV && new URLSearchParams(location.search).has('preview')
@@ -71,6 +86,15 @@ const previewSnapshot: DashboardSnapshot = {
     { id: 1, status: 'active', expires_at: '2026-08-26T00:00:00Z', daily_usage_usd: 6.72, weekly_usage_usd: 24.8, daily_window_start: '2026-07-18T00:00:00Z', weekly_window_start: '2026-07-14T00:00:00Z', group: { name: 'Claude Pro 开发者套餐', platform: 'anthropic', rate_multiplier: 0.14, daily_limit_usd: 10, weekly_limit_usd: 50 } },
     { id: 2, status: 'active', expires_at: '2026-10-01T00:00:00Z', monthly_usage_usd: 18.4, monthly_window_start: '2026-07-01T00:00:00Z', group: { name: 'OpenAI Codex 月度包', platform: 'openai', rate_multiplier: 0.07, monthly_limit_usd: 80 } },
   ],
+  subscription_summary: {
+    active_subscription_count: 2,
+    quota_count: 3,
+    selected: { subscription_id: '1', subscription_name: 'Claude Pro 开发者套餐', platform: 'anthropic', period: 'daily', used: 6.72, limit: 10, percent: 67.2 },
+  },
+  channel_monitors: { items: [
+    { id: 1, name: 'Claude Sonnet', provider: 'anthropic', primary_model: 'claude-sonnet-4-5', primary_status: 'operational', primary_latency_ms: 842, primary_ping_latency_ms: 68, availability_7d: 99.96 },
+    { id: 2, name: 'OpenAI Codex', provider: 'openai', primary_model: 'gpt-5.3-codex', primary_status: 'degraded', primary_latency_ms: 1_286, primary_ping_latency_ms: 91, availability_7d: 98.72 },
+  ] },
   fetched_at: Math.floor(Date.now() / 1000),
 }
 const previewTrend = { trend: [
@@ -223,7 +247,8 @@ const subscriptions = computed<SubscriptionCard[]>(() => {
         used,
         limit,
         remaining: Math.max(0, limit - used),
-        percent: Math.min(100, limit ? used / limit * 100 : 0),
+        percent: limit ? used / limit * 100 : 0,
+        progressPercent: Math.min(100, limit ? used / limit * 100 : 0),
         resetAt: windowStart ? new Date(new Date(windowStart).getTime() + hours * 3_600_000).toISOString() : undefined,
       })
     }
@@ -310,10 +335,46 @@ const usageRecords = computed<UsageRecord[]>(() => {
       cost: Number(row.actual_cost ?? row.total_cost ?? 0),
       time: typeof row.created_at === 'string' ? row.created_at : undefined,
       source: String(group.name ?? apiKey.name ?? row.request_type ?? 'API 请求'),
+      statusCode: Number.isFinite(status) ? status : undefined,
       success: !Number.isFinite(status) || status < 400,
     }
   })
 })
+
+const channelMonitors = computed<ChannelMonitor[]>(() => {
+  return arrayFrom(snapshot.value?.channel_monitors, [['items'], ['monitors']]).map((item, index) => {
+    const monitor = asRecord(item)
+    const rawState = String(monitor.primary_status ?? monitor.status ?? 'unknown')
+    const state = ['operational', 'degraded', 'failed', 'error'].includes(rawState)
+      ? rawState as ChannelMonitor['state']
+      : 'unknown'
+    return {
+      id: String(monitor.id ?? index),
+      name: String(monitor.name ?? monitor.primary_model ?? '渠道监控'),
+      provider: platformName(String(monitor.provider ?? monitor.platform ?? 'unknown')),
+      model: String(monitor.primary_model ?? monitor.model ?? '未知模型'),
+      groupName: typeof monitor.group_name === 'string' ? monitor.group_name : undefined,
+      state,
+      label: channelStatusLabel(state),
+      latency: optionalNumber(monitor.primary_latency_ms ?? monitor.latency_ms),
+      pingLatency: optionalNumber(monitor.primary_ping_latency_ms ?? monitor.ping_latency_ms),
+      availability: optionalNumber(monitor.availability_7d),
+    }
+  }).sort((left, right) => channelStatusPriority(left.state) - channelStatusPriority(right.state) || left.name.localeCompare(right.name))
+})
+
+function optionalNumber(value: unknown): number | undefined {
+  const number = Number(value)
+  return Number.isFinite(number) ? number : undefined
+}
+
+function channelStatusLabel(state: ChannelMonitor['state']): string {
+  return ({ operational: '正常', degraded: '性能下降', failed: '故障', error: '异常', unknown: '未知' })[state]
+}
+
+function channelStatusPriority(state: ChannelMonitor['state']): number {
+  return ({ failed: 0, error: 1, degraded: 2, operational: 3, unknown: 4 })[state]
+}
 
 function platformName(value: string): string {
   return ({ anthropic: 'Claude', openai: 'OpenAI', gemini: 'Gemini', antigravity: 'Antigravity', grok: 'Grok' } as Record<string, string>)[value] ?? value
@@ -612,15 +673,29 @@ onBeforeUnmount(() => {
             <div><span>今日 Token</span><strong>{{ formatTokens(todayTokens) }}</strong></div>
           </section>
 
+          <section class="channel-section">
+            <div class="section-title"><div><strong>渠道状态</strong><span>来自 NekoAPI 网页的渠道监控</span></div><small v-if="snapshot?.channel_monitors_error">读取失败</small><small v-else>7 日可用率</small></div>
+            <div class="channel-list">
+              <div v-for="channel in channelMonitors" :key="channel.id" class="channel-row">
+                <span class="channel-dot" :class="channel.state"></span>
+                <div><strong>{{ channel.name }}</strong><span>{{ channel.provider }} · {{ channel.model }}<template v-if="channel.groupName"> · {{ channel.groupName }}</template></span></div>
+                <span>{{ channel.latency == null ? '延迟 --' : `延迟 ${Math.round(channel.latency)}ms` }}<template v-if="channel.pingLatency != null"> · Ping {{ Math.round(channel.pingLatency) }}ms</template></span>
+                <b>{{ channel.availability == null ? '--' : `${channel.availability.toFixed(2)}%` }}</b>
+                <small :class="channel.state">{{ channel.label }}</small>
+              </div>
+              <div v-if="!channelMonitors.length" class="channel-empty">{{ snapshot?.channel_monitors_error ? '渠道状态暂不可用' : '暂无渠道监控数据' }}</div>
+            </div>
+          </section>
+
           <section class="subscription-section">
-            <div class="section-title"><div><strong>订阅额度</strong><span>{{ subscriptions.length ? `${subscriptions.length} 个有效订阅` : '未检测到有效订阅' }}</span></div><small v-if="snapshot?.subscriptions_error">读取失败</small></div>
+            <div class="section-title"><div><strong>订阅额度</strong><span>{{ subscriptions.length ? `${subscriptions.length} 个有效订阅 · 菜单栏显示最高占用率` : '未检测到有效订阅' }}</span></div><small v-if="snapshot?.subscriptions_error">读取失败</small></div>
             <div v-if="subscriptions.length" class="subscription-list">
               <article v-for="subscription in subscriptions" :key="subscription.id" class="subscription-card">
                 <div class="subscription-head"><div><strong>{{ subscription.name }}</strong><span>{{ subscription.platform }} · 倍率 {{ formatMultiplier(subscription.rateMultiplier) }} · {{ relativeDate(subscription.expiresAt) }}</span></div><i>{{ subscription.status === 'active' ? '有效' : subscription.status }}</i></div>
                 <div v-if="subscription.quotas.length" class="quota-list">
                   <div v-for="quota in subscription.quotas" :key="quota.label" class="quota-row">
                     <div><span>{{ quota.label }}</span><strong>剩余 ${{ formatMoney(quota.remaining) }}</strong></div>
-                    <div class="progress-track"><i :class="{ warning: quota.percent >= 80 }" :style="{ width: `${quota.percent}%` }"></i></div>
+                    <div class="progress-track"><i :class="{ warning: quota.percent >= 80 }" :style="{ width: `${quota.progressPercent}%` }"></i></div>
                     <small>已用 ${{ formatMoney(quota.used) }} / ${{ formatMoney(quota.limit) }} · {{ quota.percent.toFixed(1) }}%<em v-if="quota.resetAt">{{ relativeDate(quota.resetAt, '重置') }}</em></small>
                   </div>
                 </div>

@@ -4,7 +4,22 @@ export interface DashboardSnapshot {
   profile: Record<string, unknown>
   stats: Record<string, unknown>
   subscriptions: unknown
+  subscription_summary?: {
+    active_subscription_count: number
+    quota_count: number
+    selected?: {
+      subscription_id: string
+      subscription_name: string
+      platform: string
+      period: 'daily' | 'weekly' | 'monthly'
+      used: number
+      limit: number
+      percent: number
+    } | null
+  }
   subscriptions_error?: string | null
+  channel_monitors?: unknown
+  channel_monitors_error?: string | null
   fetched_at: number
 }
 
