@@ -657,7 +657,7 @@ onBeforeUnmount(() => {
         <button class="panel-refresh round-button" :class="{ rotating: loading }" title="刷新" @click="refreshData(true)"><svg viewBox="0 0 24 24"><path d="M20 6v5h-5M4 18v-5h5M6.1 9a7 7 0 0 1 11.5-2.6L20 8.5M4 15.5l2.4 2.1A7 7 0 0 0 17.9 15"/></svg></button>
 
         <div v-if="settingsOpen" class="settings-popover">
-          <div><strong>自动刷新</strong><span>常规同步仅 3 个只读请求</span></div>
+          <div><strong>自动刷新</strong><span>常规同步使用 6 个只读请求</span></div>
           <select v-model="refreshMinutes" @change="updateInterval"><option :value="15">15 分钟</option><option :value="30">30 分钟</option><option :value="60">60 分钟</option></select>
           <button @click="handleLogout">退出登录</button>
         </div>

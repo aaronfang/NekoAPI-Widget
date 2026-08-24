@@ -62,9 +62,23 @@ struct DashboardSnapshot {
     subscriptions: Value,
     subscription_summary: SubscriptionSummary,
     subscriptions_error: Option<String>,
+    current_api_key: Option<ApiKeyRoute>,
+    api_keys_error: Option<String>,
     channel_monitors: Value,
     channel_monitors_error: Option<String>,
     fetched_at: u64,
+}
+
+struct DashboardData {
+    profile: Value,
+    stats: Value,
+    subscriptions: Value,
+    subscriptions_error: Option<String>,
+    api_keys: Value,
+    api_keys_error: Option<String>,
+    groups: Value,
+    channel_monitors: Value,
+    channel_monitors_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -109,6 +123,15 @@ struct SubscriptionSummary {
     active_subscription_count: usize,
     quota_count: usize,
     selected: Option<QuotaSummaryItem>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct ApiKeyRoute {
+    key_id: String,
+    key_name: String,
+    group_id: String,
+    group_name: String,
+    platform: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,24 +361,34 @@ async fn get_authorized(
     Ok((status, value))
 }
 
-async fn fetch_dashboard_data(
-    client: &Client,
-    token: &str,
-) -> Result<(Value, Value, Value, Option<String>, Value, Option<String>), String> {
-    let (profile_result, stats_result, subscriptions_result, channel_monitors_result) = tokio::join!(
+async fn fetch_dashboard_data(client: &Client, token: &str) -> Result<DashboardData, String> {
+    let (
+        profile_result,
+        stats_result,
+        subscriptions_result,
+        api_keys_result,
+        groups_result,
+        channel_monitors_result,
+    ) = tokio::join!(
         get_authorized(client, "/user/profile", token),
         get_authorized(client, "/usage/dashboard/stats", token),
         get_authorized(client, "/subscriptions/active", token),
+        get_authorized(client, "/keys", token),
+        get_authorized(client, "/groups/available", token),
         get_authorized(client, "/channel-monitors", token)
     );
     let (profile_status, profile) = profile_result?;
     let (stats_status, stats) = stats_result?;
     let (subscriptions_status, subscriptions) = subscriptions_result?;
+    let (api_keys_status, api_keys) = api_keys_result?;
+    let (groups_status, groups) = groups_result?;
     let (channel_monitors_status, channel_monitors) = channel_monitors_result?;
 
     if profile_status == StatusCode::UNAUTHORIZED
         || stats_status == StatusCode::UNAUTHORIZED
         || subscriptions_status == StatusCode::UNAUTHORIZED
+        || api_keys_status == StatusCode::UNAUTHORIZED
+        || groups_status == StatusCode::UNAUTHORIZED
         || channel_monitors_status == StatusCode::UNAUTHORIZED
     {
         return Err("__SESSION_EXPIRED__".to_string());
@@ -384,6 +417,29 @@ async fn fetch_dashboard_data(
             )),
         )
     };
+    let (api_keys, api_keys_error) = if api_keys_status.is_success() {
+        (unwrap_payload(api_keys)?, None)
+    } else {
+        (
+            Value::Array(Vec::new()),
+            Some(api_error(
+                &api_keys,
+                &format!("API 密钥请求失败（HTTP {api_keys_status}）"),
+            )),
+        )
+    };
+    let (groups, groups_error) = if groups_status.is_success() {
+        (unwrap_payload(groups)?, None)
+    } else {
+        (
+            Value::Array(Vec::new()),
+            Some(api_error(
+                &groups,
+                &format!("分组请求失败（HTTP {groups_status}）"),
+            )),
+        )
+    };
+    let api_keys_error = api_keys_error.or(groups_error);
     let (channel_monitors, channel_monitors_error) = if channel_monitors_status.is_success() {
         (unwrap_payload(channel_monitors)?, None)
     } else {
@@ -396,14 +452,17 @@ async fn fetch_dashboard_data(
         )
     };
 
-    Ok((
-        unwrap_payload(profile)?,
-        unwrap_payload(stats)?,
+    Ok(DashboardData {
+        profile: unwrap_payload(profile)?,
+        stats: unwrap_payload(stats)?,
         subscriptions,
         subscriptions_error,
+        api_keys,
+        api_keys_error,
+        groups,
         channel_monitors,
         channel_monitors_error,
-    ))
+    })
 }
 
 fn json_number(value: &Value, key: &str) -> f64 {
@@ -520,8 +579,55 @@ fn subscription_summary(subscriptions: &Value) -> SubscriptionSummary {
     }
 }
 
-fn channel_light_state(channel_monitors: &Value, platform: Option<&str>) -> ChannelLightState {
+fn current_api_key_route(api_keys: &Value, groups: &Value) -> Option<ApiKeyRoute> {
+    let key = subscription_items(api_keys)
+        .iter()
+        .filter(|key| {
+            key.get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("active")
+                == "active"
+        })
+        .max_by(|left, right| {
+            left.get("last_used_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .cmp(
+                    right
+                        .get("last_used_at")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )
+                .then_with(|| json_number(left, "id").total_cmp(&json_number(right, "id")))
+        })?;
+    let group_id = string_value(key.get("group_id"), "");
+    let group = subscription_items(groups)
+        .iter()
+        .find(|group| string_value(group.get("id"), "") == group_id)?;
+
+    Some(ApiKeyRoute {
+        key_id: string_value(key.get("id"), ""),
+        key_name: string_value(key.get("name"), "API Key"),
+        group_id,
+        group_name: string_value(group.get("name"), "未知分组"),
+        platform: string_value(group.get("platform"), ""),
+    })
+}
+
+fn is_discount_route(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    ["特惠", "优惠", "discount", "budget", "cheap"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+fn channel_light_state(
+    channel_monitors: &Value,
+    platform: Option<&str>,
+    group_name: Option<&str>,
+) -> ChannelLightState {
     let normalized_platform = platform.map(str::to_ascii_lowercase);
+    let discount_route = group_name.map(is_discount_route);
     subscription_items(channel_monitors)
         .iter()
         .filter(|monitor| {
@@ -533,6 +639,18 @@ fn channel_light_state(channel_monitors: &Value, platform: Option<&str>) -> Chan
                 .or_else(|| monitor.get("platform"))
                 .and_then(Value::as_str)
                 .is_some_and(|provider| provider.eq_ignore_ascii_case(platform))
+        })
+        .filter(|monitor| {
+            let Some(discount_route) = discount_route else {
+                return true;
+            };
+            let monitor_route = monitor
+                .get("group_name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .or_else(|| monitor.get("name").and_then(Value::as_str))
+                .unwrap_or_default();
+            is_discount_route(monitor_route) == discount_route
         })
         .map(|monitor| {
             match monitor
@@ -590,19 +708,28 @@ fn update_tray_summary(
     app: &tauri::AppHandle,
     stats: &Value,
     summary: &SubscriptionSummary,
+    current_api_key: Option<&ApiKeyRoute>,
     channel_monitors: &Value,
 ) {
     let today_tokens = json_number(stats, "today_tokens");
     let token_label = compact_tokens(today_tokens);
-    // Keep the light and percentage about the same subscription. If there is
-    // no quota-selected subscription, fall back to the worst published status.
+    // The light follows the most recently used active API key. Quota text can
+    // still come from a different subscription.
     let channel_state = channel_light_state(
         channel_monitors,
-        summary
-            .selected
-            .as_ref()
-            .map(|quota| quota.platform.as_str()),
+        current_api_key
+            .map(|key| key.platform.as_str())
+            .or_else(|| {
+                summary
+                    .selected
+                    .as_ref()
+                    .map(|quota| quota.platform.as_str())
+            }),
+        current_api_key.map(|key| key.group_name.as_str()),
     );
+    let key_route_label = current_api_key
+        .map(|key| format!("\n当前密钥：{} · {}", key.key_name, key.group_name))
+        .unwrap_or_default();
     let (title, tooltip) = if let Some(quota) = &summary.selected {
         let extra_subscriptions = summary.active_subscription_count.saturating_sub(1);
         let extra_label = if extra_subscriptions > 0 {
@@ -613,13 +740,14 @@ fn update_tray_summary(
         (
             format!("{token_label} · {:.0}%", quota.percent),
             format!(
-                "渠道状态：{}\n今日 Token {token_label}\n最高占用：{} · {}\n${:.2} / ${:.2}（{:.1}%）{}",
+                "渠道状态：{}\n今日 Token {token_label}\n最高占用：{} · {}\n${:.2} / ${:.2}（{:.1}%）{}{}",
                 channel_state.label(),
                 quota.subscription_name,
                 quota.period.label(),
                 quota.used,
                 quota.limit,
                 quota.percent,
+                key_route_label,
                 extra_label
             ),
         )
@@ -627,9 +755,10 @@ fn update_tray_summary(
         (
             format!("{token_label} · --%"),
             format!(
-                "渠道状态：{}\n今日 Token {token_label}\n未检测到有效订阅额度（{} 个有效订阅）",
+                "渠道状态：{}\n今日 Token {token_label}\n未检测到有效订阅额度（{} 个有效订阅）{}",
                 channel_state.label(),
                 summary.active_subscription_count,
+                key_route_label,
             ),
         )
     };
@@ -791,12 +920,72 @@ mod tests {
         });
 
         assert_eq!(
-            channel_light_state(&monitors, Some("anthropic")),
+            channel_light_state(&monitors, Some("anthropic"), None),
             ChannelLightState::Degraded
         );
         assert_eq!(
-            channel_light_state(&monitors, Some("openai")),
+            channel_light_state(&monitors, Some("openai"), None),
             ChannelLightState::Operational
+        );
+    }
+
+    #[test]
+    fn normal_openai_group_does_not_inherit_discount_channel_failure() {
+        let monitors = json!({
+            "items": [
+                {
+                    "name": "gpt-5.6-sol（随时拉闸特惠）",
+                    "provider": "openai",
+                    "primary_status": "error"
+                },
+                {
+                    "name": "GPT-5.6 Sol",
+                    "provider": "openai",
+                    "primary_status": "operational"
+                }
+            ]
+        });
+
+        assert_eq!(
+            channel_light_state(&monitors, Some("openai"), Some("pro")),
+            ChannelLightState::Operational
+        );
+    }
+
+    #[test]
+    fn resolves_the_most_recently_used_api_key_group() {
+        let keys = json!({
+            "items": [
+                {
+                    "id": 1,
+                    "name": "特惠 key",
+                    "group_id": 39,
+                    "status": "active",
+                    "last_used_at": "2026-08-23T10:00:00+08:00"
+                },
+                {
+                    "id": 2,
+                    "name": "正常 key",
+                    "group_id": 32,
+                    "status": "active",
+                    "last_used_at": "2026-08-24T10:00:00+08:00"
+                }
+            ]
+        });
+        let groups = json!([
+            { "id": 32, "name": "pro订阅卡", "platform": "openai" },
+            { "id": 39, "name": "特惠pro订阅卡", "platform": "openai" }
+        ]);
+
+        assert_eq!(
+            current_api_key_route(&keys, &groups),
+            Some(ApiKeyRoute {
+                key_id: "2".to_string(),
+                key_name: "正常 key".to_string(),
+                group_id: "32".to_string(),
+                group_name: "pro订阅卡".to_string(),
+                platform: "openai".to_string(),
+            })
         );
     }
 
@@ -808,7 +997,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            channel_light_state(&monitors, None),
+            channel_light_state(&monitors, None, None),
             ChannelLightState::Failed
         );
     }
@@ -857,16 +1046,25 @@ async fn fetch_dashboard(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let subscription_summary = subscription_summary(&data.2);
-    update_tray_summary(&app, &data.1, &subscription_summary, &data.4);
+    let subscription_summary = subscription_summary(&data.subscriptions);
+    let current_api_key = current_api_key_route(&data.api_keys, &data.groups);
+    update_tray_summary(
+        &app,
+        &data.stats,
+        &subscription_summary,
+        current_api_key.as_ref(),
+        &data.channel_monitors,
+    );
     Ok(DashboardSnapshot {
-        profile: data.0,
-        stats: data.1,
-        subscriptions: data.2,
+        profile: data.profile,
+        stats: data.stats,
+        subscriptions: data.subscriptions,
         subscription_summary,
-        subscriptions_error: data.3,
-        channel_monitors: data.4,
-        channel_monitors_error: data.5,
+        subscriptions_error: data.subscriptions_error,
+        current_api_key,
+        api_keys_error: data.api_keys_error,
+        channel_monitors: data.channel_monitors,
+        channel_monitors_error: data.channel_monitors_error,
         fetched_at,
     })
 }
@@ -1286,7 +1484,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 pub fn run() {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(20))
-        .user_agent("NekoAPI-Widget/0.5.0 (+low-frequency account monitor)")
+        .user_agent("NekoAPI-Widget/0.5.1 (+low-frequency account monitor)")
         .build()
         .expect("failed to build HTTP client");
 

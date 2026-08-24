@@ -12,10 +12,10 @@
 - Token 统一使用 `M` / `K` 单位，并提供独立的 7 日 Token 趋势图
 - 套餐显示当前服务倍率；Token 趋势同时展示 Input、Output、Cache Creation、Cache Read 和 Cache Hit Rate
 - 菜单栏采用紧凑的 `今日 Token · 最高额度占用率` 格式；多订阅、多周期时显示最接近耗尽的一项
-- 菜单栏图标使用当前最高占用订阅对应渠道的状态灯：绿色正常、黄色性能下降、红色故障、灰色未知
+- 菜单栏图标使用最近使用的有效 API Key 所属分组对应渠道的状态灯：绿色正常、黄色性能下降、红色故障、灰色未知
 - 显示有效订阅的日、周、月消耗、剩余额度、到期和重置时间
 - 显示 NekoAPI 网页渠道监控中的状态、探测延迟、Ping 延迟和 7 日可用率
-- 每次常规同步请求用户资料、用量汇总、有效订阅和网页渠道监控四个只读接口
+- 每次常规同步请求用户资料、用量汇总、有效订阅、API Key、可用分组和网页渠道监控六个只读接口
 - 15、30、60 分钟自动刷新，附带 ±10% 随机抖动
 - 手动刷新 30 秒冷却，失败后指数退避，最长两小时
 - 隐藏窗口后继续通过菜单栏显示、刷新或退出
@@ -47,11 +47,11 @@ npm run tauri build -- --bundles app
 
 Linux 默认使用 AppIndicator/StatusNotifier 系统托盘，可安装发布页提供的 `.deb` 或 `.AppImage`。登录令牌保存在 Secret Service；Debian/Ubuntu 需要可用的 `gnome-keyring` 或兼容服务。
 
-XFCE 内建 systray 不显示 AppIndicator 的动态文字，也不向应用提供主点击事件和图标位置。发布页同时提供 `NekoAPI-Widget-v0.5.0-xfce-panel.tar.gz`，它通过 GenMon 显示 `今日 Token · 订阅已用%`，支持单击直接显示/隐藏，并让面板锚定在点击位置下方：
+XFCE 内建 systray 不显示 AppIndicator 的动态文字，也不向应用提供主点击事件和图标位置。发布页同时提供 `NekoAPI-Widget-v0.5.1-xfce-panel.tar.gz`，它通过 GenMon 显示 `今日 Token · 订阅已用%`，支持单击直接显示/隐藏，并让面板锚定在点击位置下方：
 
 ```bash
 sudo apt install xfce4-genmon-plugin xdotool
-tar -xzf NekoAPI-Widget-v0.5.0-xfce-panel.tar.gz
+tar -xzf NekoAPI-Widget-v0.5.1-xfce-panel.tar.gz
 ./linux/install-xfce-panel.sh
 ```
 
@@ -93,6 +93,9 @@ Windows 气泡会检测任务栏所在边缘：底部任务栏向上展开，顶
 - `GET /user/profile`
 - `GET /usage/dashboard/stats`
 - `GET /subscriptions/active`
+- `GET /keys`
+- `GET /groups/available`
+- `GET /channel-monitors`
 
 以下明细接口在对应界面需要时加载，并缓存 15 分钟：
 

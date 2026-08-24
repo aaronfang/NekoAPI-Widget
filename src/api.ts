@@ -18,6 +18,14 @@ export interface DashboardSnapshot {
     } | null
   }
   subscriptions_error?: string | null
+  current_api_key?: {
+    key_id: string
+    key_name: string
+    group_id: string
+    group_name: string
+    platform: string
+  } | null
+  api_keys_error?: string | null
   channel_monitors?: unknown
   channel_monitors_error?: string | null
   fetched_at: number
