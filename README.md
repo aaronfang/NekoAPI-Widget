@@ -15,7 +15,7 @@
 - 菜单栏图标使用最近使用的有效 API Key 所属分组对应渠道的状态灯：绿色正常、黄色性能下降、红色故障、灰色未知
 - 显示有效订阅的日、周、月消耗、剩余额度、到期和重置时间
 - 显示 NekoAPI 网页渠道监控中的状态、探测延迟、Ping 延迟和 7 日可用率
-- 显示幸运抽奖的期号、截止时间、参与人数和参与状态，站长开启新一期时发送系统通知并在托盘标记
+- 显示幸运抽奖的期号、截止时间、参与人数和参与状态；站长开启新一期时发送系统通知，并在状态灯右上角叠加琥珀色标记
 - 支持手动参与当前抽奖；可开启自动参与，检测到可参与后随机延迟 1–15 分钟再提交
 - 每次常规同步请求用户资料、用量汇总、有效订阅、API Key、可用分组和网页渠道监控六个只读接口
 - 15、30、60 分钟自动刷新，附带 ±10% 随机抖动
@@ -39,11 +39,19 @@ npm run build
 npm run tauri build
 ```
 
-生成 macOS 应用：
+### macOS
+
+首次启动会弹出钥匙串授权提示，因为登录令牌保存在 Keychain。开发构建每次重新编译都会改变 adhoc 签名，系统可能反复询问，点击「始终允许」即可。
+
+生成应用包，或生成发布页使用的通用磁盘映像：
 
 ```bash
 npm run tauri build -- --bundles app
+rustup target add x86_64-apple-darwin   # 首次构建通用包时需要
+npm run tauri build -- --bundles dmg --target universal-apple-darwin
 ```
+
+首次投递系统通知时 macOS 会请求通知权限，这次授权请求会占用掉第一条通知，授权通过后新一期抽奖才会真正弹出横幅。开发模式下 `tauri-plugin-notification` 会把通知归属到 `com.apple.Terminal`，而 Terminal 通常未开启通知，因此**通知只能在打包后的应用中验证**。
 
 ### Linux
 
@@ -53,7 +61,7 @@ XFCE 内建 systray 不显示 AppIndicator 的动态文字，也不向应用提�
 
 ```bash
 sudo apt install xfce4-genmon-plugin xdotool
-tar -xzf NekoAPI-Widget-v0.5.1-xfce-panel.tar.gz   # 替换为发布页上的实际标签
+tar -xzf NekoAPI-Widget-v0.5.2-xfce-panel.tar.gz   # 替换为发布页上的实际标签
 ./linux/install-xfce-panel.sh
 ```
 
@@ -86,7 +94,7 @@ Windows 气泡会检测任务栏所在边缘：底部任务栏向上展开，顶
 - Linux x64 Debian 包和 AppImage（`.deb` / `.AppImage`）
 - XFCE 面板集成脚本（`.tar.gz`）
 
-也可以在 Actions 中手动触发 `Release` 工作流做分阶段发布：指定标签和平台（`all` / `windows` / `macos` / `linux`），只有被选中的平台会构建，产物追加到该标签的 Release。例如先只发布 Windows，待 macOS 验证通过后再以同一标签追加 macOS（追加时用 `--ref <标签>` 指向同一提交，避免产物与标签不一致）。
+也可以在 Actions 中手动触发 `Release` 工作流做分阶段发布：指定标签和平台（`all` / `windows` / `macos` / `linux`），只有被选中的平台会构建，产物追加到该标签的 Release。例如先只发布 Windows，待 macOS 验证通过后再以同一标签追加 macOS（追加时用 `--ref <标签>` 指向同一提交，避免产物与标签不一致）。若被推迟的平台在验证中暴露了必须先修复的问题，应把修复合入标签指向的提交（必要时重新打标签）再构建，否则该平台产物对应的源码会与标签不一致。
 
 当前发布包未进行 Apple Developer ID 或 Windows Authenticode 签名，系统可能显示来源确认提示。
 

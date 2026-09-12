@@ -770,8 +770,8 @@ fn status_light_icon(state: ChannelLightState, lottery_marker: bool) -> Image<'s
             } else {
                 [0, 0, 0, 0]
             };
-            // Windows never renders a tray title, so an in-progress lucky draw
-            // is surfaced as a small amber badge on the status light instead.
+            // An in-progress lucky draw is surfaced as a small amber badge on
+            // the status light, on every platform.
             if lottery_marker {
                 let badge_dx = x as f32 - 25.0;
                 let badge_dy = y as f32 - 7.0;
@@ -898,12 +898,13 @@ fn render_tray(app: &tauri::AppHandle) {
     if title.is_empty() {
         return;
     }
-    let marker_suffix = if marker { " · 抽奖" } else { "" };
+    // The amber badge on the status light already marks an in-progress lucky
+    // draw, so the title stays the plain token/quota summary.
     // Windows truncates tray tooltips at 128 characters, so the lucky-draw
     // marker leads the tooltip to stay visible no matter how long the quota
     // and key details below it get.
     let marker_tooltip = if marker { "幸运抽奖进行中\n" } else { "" };
-    let final_title = format!("{title}{marker_suffix}");
+    let final_title = title;
     let final_tooltip = format!("{marker_tooltip}{tooltip}");
 
     #[cfg(target_os = "linux")]
