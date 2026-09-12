@@ -1,13 +1,18 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { api, type DashboardSnapshot, type LoginOutcome } from './api'
+import { api, type DashboardSnapshot, type LoginOutcome, type LotterySnapshot } from './api'
 
 const CACHE_KEY = 'nekoapi-widget:dashboard-cache:v2'
 const VIEW_CACHE_KEY = 'nekoapi-widget:view-cache:v1'
 const INTERVAL_KEY = 'nekoapi-widget:refresh-minutes'
+const LOTTERY_SETTING_KEY = 'nekoapi-widget:lottery-enabled'
+const AUTO_JOIN_KEY = 'nekoapi-widget:auto-join'
 const MANUAL_COOLDOWN_MS = 30_000
 const DETAIL_STALE_MS = 15 * 60_000
+const LOTTERY_INTERVAL_MS = 5 * 60_000
+const AUTO_JOIN_MIN_MS = 60_000
+const AUTO_JOIN_MAX_MS = 15 * 60_000
 const DAY_MS = 86_400_000
 
 type Tab = 'overview' | 'records'
@@ -140,7 +145,14 @@ const trendFetchedAt = ref(previewMode ? Date.now() : detailCache.trendFetchedAt
 const recordsFetchedAt = ref(previewMode ? Date.now() : detailCache.recordsFetchedAt)
 const refreshMinutes = ref(readInterval())
 const failureCount = ref(0)
+const lotteryEnabled = ref(readLotteryEnabled())
+const lotterySnapshot = ref<LotterySnapshot | null>(null)
+const lotteryJoining = ref(false)
+const autoJoinEnabled = ref(readAutoJoin())
 let refreshTimer: number | undefined
+let lotteryTimer: number | undefined
+let autoJoinTimer: number | undefined
+let autoJoinRoundId: number | null = null
 let noticeTimer: number | undefined
 let lastManualRefresh = 0
 let unlistenRefresh: UnlistenFn | undefined
@@ -176,6 +188,33 @@ function readInterval(): number {
   const value = Number(localStorage.getItem(INTERVAL_KEY))
   return [15, 30, 60].includes(value) ? value : 15
 }
+
+function readLotteryEnabled(): boolean {
+  const value = localStorage.getItem(LOTTERY_SETTING_KEY)
+  return value === null ? true : value !== 'false'
+}
+
+function persistLotteryEnabled(value: boolean) {
+  localStorage.setItem(LOTTERY_SETTING_KEY, value ? 'true' : 'false')
+}
+
+function readAutoJoin(): boolean {
+  return localStorage.getItem(AUTO_JOIN_KEY) === 'true'
+}
+
+function persistAutoJoin(value: boolean) {
+  localStorage.setItem(AUTO_JOIN_KEY, value ? 'true' : 'false')
+}
+
+function systemTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+  } catch {
+    return 'UTC'
+  }
+}
+
+const timezone = systemTimezone()
 
 function asRecord(value: unknown): JsonRecord {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as JsonRecord : {}
@@ -266,6 +305,66 @@ const subscriptions = computed<SubscriptionCard[]>(() => {
 })
 
 const primarySubscription = computed(() => subscriptions.value[0])
+
+const LOTTERY_REASON_TEXT: Record<string, string> = {
+  recharge_or_subscription_required: '需充值或订阅',
+  recharge_below_minimum: '充值金额未达门槛',
+  account_too_new: '账号注册时间不足',
+  account_inactive: '账号不活跃',
+  email_verification_required: '需先验证邮箱',
+  disabled: '抽奖功能已停用',
+  no_open_round: '暂无开放期次',
+  round_closed: '本期已结束',
+}
+
+function snapshotCanJoin(snapshot: LotterySnapshot): boolean {
+  const round = snapshot.current_round
+  if (!round || !snapshot.server_enabled) return false
+  if (snapshot.participated) return false
+  if (snapshot.eligibility?.eligible !== true) return false
+  if (round.status !== 'open') return false
+  if (round.closes_at && new Date(round.closes_at).getTime() <= Date.now()) return false
+  if (round.participant_count != null && round.target_participants != null
+    && round.participant_count >= round.target_participants) return false
+  return true
+}
+
+const lotteryInfo = computed(() => {
+  const snapshot = lotterySnapshot.value
+  if (!snapshot || !snapshot.server_enabled) return null
+  const round = snapshot.current_round
+  if (!round) {
+    return { label: '暂无进行中的抽奖', status: '', tone: 'idle' as const, canJoin: false, round: null }
+  }
+  const canJoin = snapshotCanJoin(snapshot)
+  const expired = !!round.closes_at && new Date(round.closes_at).getTime() <= Date.now()
+  const full = round.participant_count != null && round.target_participants != null
+    && round.participant_count >= round.target_participants
+  const eligible = snapshot.eligibility?.eligible === true
+
+  let status = ''
+  let tone: 'joined' | 'ready' | 'blocked' | 'idle' = 'idle'
+  if (snapshot.participated) {
+    status = '已参与'
+    tone = 'joined'
+  } else if (!eligible) {
+    const code = snapshot.eligibility?.reason_code
+    status = (code ? LOTTERY_REASON_TEXT[code] : undefined) ?? snapshot.eligibility?.reason ?? '不满足参与条件'
+    tone = 'blocked'
+  } else if (round.status !== 'open') {
+    status = '本期已结束'
+  } else if (expired) {
+    status = '已过期'
+  } else if (full) {
+    status = '名额已满'
+  } else {
+    status = '可参与'
+    tone = 'ready'
+  }
+
+  const label = `${round.number != null ? `第 ${round.number} 期` : '抽奖进行中'}${round.closes_at ? ` · 截止 ${formatDateTime(round.closes_at)}` : ''}`
+  return { label, status, tone, canJoin, round }
+})
 
 const trendPoints = computed(() => {
   const raw = arrayFrom(trendPayload.value, [['trend'], ['items'], ['data']])
@@ -505,6 +604,7 @@ async function refreshData(manual = false) {
     scheduleRefresh()
     if (activeTab.value === 'overview') await loadTrend(manual)
     else if (manual) await loadRecords(true)
+    if (manual) refreshLottery(false)
     if (manual) showNotice('数据已更新')
   } catch (reason) {
     const message = friendlyError(reason)
@@ -559,7 +659,13 @@ async function finishLogin(result: LoginOutcome) {
   }
   authenticated.value = true
   loading.value = false
+  try {
+    const persisted = await api.getLotterySettings()
+    lotteryEnabled.value = persisted.enabled
+    persistLotteryEnabled(persisted.enabled)
+  } catch { /* ignore — use the local cached value */ }
   await refreshData(false)
+  scheduleLottery(0)
 }
 
 async function handleLogout() {
@@ -569,15 +675,120 @@ async function handleLogout() {
   snapshot.value = null
   trendPayload.value = null
   recordsPayload.value = null
+  lotterySnapshot.value = null
   localStorage.removeItem(CACHE_KEY)
   localStorage.removeItem(VIEW_CACHE_KEY)
   if (refreshTimer) window.clearTimeout(refreshTimer)
+  if (lotteryTimer) window.clearTimeout(lotteryTimer)
+  cancelAutoJoin()
 }
 
 function updateInterval() {
   localStorage.setItem(INTERVAL_KEY, String(refreshMinutes.value))
   scheduleRefresh()
   showNotice(`自动刷新已调整为 ${refreshMinutes.value} 分钟`)
+}
+
+function scheduleLottery(delay?: number) {
+  if (lotteryTimer) window.clearTimeout(lotteryTimer)
+  if (!authenticated.value) return
+  const base = delay ?? LOTTERY_INTERVAL_MS
+  lotteryTimer = window.setTimeout(() => refreshLottery(false), base * (0.9 + Math.random() * 0.2))
+}
+
+async function refreshLottery(manual: boolean) {
+  if (!authenticated.value) return
+  try {
+    const snapshot = await api.pollLottery(timezone)
+    lotterySnapshot.value = snapshot
+    if (autoJoinEnabled.value && snapshotCanJoin(snapshot) && snapshot.current_round) {
+      scheduleAutoJoin(snapshot.current_round.id)
+    } else {
+      cancelAutoJoin()
+    }
+    if (manual) showNotice(snapshot.has_open_round ? '当前有正在进行的抽奖' : '抽奖状态已更新')
+    scheduleLottery()
+  } catch (reason) {
+    scheduleLottery(LOTTERY_INTERVAL_MS * 2)
+    if (manual) showNotice(`抽奖状态暂不可用：${friendlyError(reason)}`)
+  }
+}
+
+async function joinCurrentLottery() {
+  const info = lotteryInfo.value
+  if (!info?.canJoin || !info.round || lotteryJoining.value) return
+  const round = info.round
+  lotteryJoining.value = true
+  try {
+    await api.joinLottery(round.id)
+    cancelAutoJoin()
+    await refreshLottery(false)
+    showNotice(`已参与第 ${round.number ?? round.id} 期抽奖`)
+  } catch (reason) {
+    showNotice(`参与失败：${friendlyError(reason)}`)
+    await refreshLottery(false)
+  } finally {
+    lotteryJoining.value = false
+  }
+}
+
+function cancelAutoJoin() {
+  if (autoJoinTimer) window.clearTimeout(autoJoinTimer)
+  autoJoinTimer = undefined
+  autoJoinRoundId = null
+}
+
+function scheduleAutoJoin(roundId: number) {
+  if (autoJoinRoundId === roundId) return
+  cancelAutoJoin()
+  autoJoinRoundId = roundId
+  const delay = AUTO_JOIN_MIN_MS + Math.random() * (AUTO_JOIN_MAX_MS - AUTO_JOIN_MIN_MS)
+  autoJoinTimer = window.setTimeout(() => attemptAutoJoin(roundId), delay)
+  showNotice(`已安排自动参与（约 ${Math.round(delay / 60_000)} 分钟后）`)
+}
+
+async function attemptAutoJoin(roundId: number) {
+  autoJoinTimer = undefined
+  autoJoinRoundId = null
+  if (!autoJoinEnabled.value || !authenticated.value) return
+  try {
+    const snapshot = await api.fetchLottery(timezone)
+    lotterySnapshot.value = snapshot
+    if (!snapshotCanJoin(snapshot) || snapshot.current_round?.id !== roundId) return
+    await api.joinLottery(roundId)
+    await refreshLottery(false)
+    showNotice(`已自动参与第 ${snapshot.current_round?.number ?? roundId} 期抽奖`)
+  } catch (reason) {
+    showNotice(`自动参与失败：${friendlyError(reason)}`)
+  }
+}
+
+function toggleAutoJoin() {
+  const next = !autoJoinEnabled.value
+  autoJoinEnabled.value = next
+  persistAutoJoin(next)
+  if (next) {
+    showNotice('自动参与已开启（随机延迟 1–15 分钟）')
+    if (authenticated.value) refreshLottery(false)
+  } else {
+    cancelAutoJoin()
+    showNotice('自动参与已关闭')
+  }
+}
+
+async function toggleLotteryNotifications() {
+  const next = !lotteryEnabled.value
+  lotteryEnabled.value = next
+  persistLotteryEnabled(next)
+  try {
+    await api.setLotteryNotificationEnabled(next)
+    showNotice(next ? '幸运抽奖提醒已开启' : '幸运抽奖提醒已关闭')
+    if (next && authenticated.value) refreshLottery(false)
+  } catch (reason) {
+    lotteryEnabled.value = !next
+    persistLotteryEnabled(!next)
+    showNotice(`切换失败：${friendlyError(reason)}`)
+  }
 }
 
 function cancelTwoFactor() {
@@ -595,7 +806,15 @@ onMounted(async () => {
   if (previewMode) return
   try {
     authenticated.value = await api.hasSession()
-    if (authenticated.value) await refreshData(false)
+    if (authenticated.value) {
+      try {
+        const persisted = await api.getLotterySettings()
+        lotteryEnabled.value = persisted.enabled
+        persistLotteryEnabled(persisted.enabled)
+      } catch { /* ignore */ }
+      await refreshData(false)
+      scheduleLottery(0)
+    }
   } catch (reason) {
     error.value = friendlyError(reason)
   } finally {
@@ -612,6 +831,8 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   if (refreshTimer) window.clearTimeout(refreshTimer)
+  if (lotteryTimer) window.clearTimeout(lotteryTimer)
+  cancelAutoJoin()
   if (noticeTimer) window.clearTimeout(noticeTimer)
   document.removeEventListener('visibilitychange', onVisibilityChange)
   unlistenRefresh?.()
@@ -659,12 +880,26 @@ onBeforeUnmount(() => {
         <div v-if="settingsOpen" class="settings-popover">
           <div><strong>自动刷新</strong><span>常规同步使用 6 个只读请求</span></div>
           <select v-model="refreshMinutes" @change="updateInterval"><option :value="15">15 分钟</option><option :value="30">30 分钟</option><option :value="60">60 分钟</option></select>
+          <button type="button" :class="['toggle-row', { on: lotteryEnabled }]" @click="toggleLotteryNotifications">
+            <span><strong>幸运抽奖提醒</strong><small>站长开启新一期时通过系统通知提示</small></span>
+            <i :class="['toggle-switch', { on: lotteryEnabled }]" aria-hidden="true"><span></span></i>
+          </button>
+          <button type="button" :class="['toggle-row', { on: autoJoinEnabled }]" @click="toggleAutoJoin">
+            <span><strong>自动参与抽奖</strong><small>可参与时随机延迟 1–15 分钟自动参与</small></span>
+            <i :class="['toggle-switch', { on: autoJoinEnabled }]" aria-hidden="true"><span></span></i>
+          </button>
           <button @click="handleLogout">退出登录</button>
         </div>
 
         <div v-if="error || notice" class="toast" :class="{ danger: error }">{{ error || notice }}</div>
 
         <div class="profile-row"><div><strong>{{ displayName }}</strong><span>{{ primarySubscription?.platform ?? '按量计费账户' }}</span></div><small>余额 ${{ formatMoney(balance) }} · 更新于 {{ formatTime(snapshot?.fetched_at) }}</small></div>
+        <div v-if="lotteryInfo" class="lottery-banner" :class="`tone-${lotteryInfo.tone}`">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11h18v2H3zM5 8h14a3 3 0 0 1 3 3v2a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3v-2a3 3 0 0 1 3-3zm2 4a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm10 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4z"/></svg>
+          <span><strong>幸运抽奖</strong> · {{ lotteryInfo.label }}</span>
+          <em v-if="lotteryInfo.status">{{ lotteryInfo.status }}</em>
+          <button v-if="lotteryInfo.canJoin" type="button" class="lottery-join" :disabled="lotteryJoining" @click="joinCurrentLottery">{{ lotteryJoining ? '参与中…' : '参与' }}</button>
+        </div>
 
         <div v-if="activeTab === 'overview'" class="tab-content overview-content">
           <section class="summary-strip">

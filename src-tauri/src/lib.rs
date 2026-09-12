@@ -4,12 +4,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[cfg(target_os = "linux")]
 use std::{
-    fs,
     io::{BufRead, BufReader, Write},
-    path::PathBuf,
     thread,
 };
 use std::{
+    fs,
+    path::PathBuf,
     sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -19,8 +19,10 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, PhysicalPosition, Rect,
 };
+use tauri_plugin_notification::NotificationExt;
 
-const API_BASE: &str = "https://999555999.com/api/v1";
+// The bare domain's TLS endpoint became unreliable, so all requests go to www.
+const API_BASE: &str = "https://www.999555999.com/api/v1";
 const KEYRING_SERVICE: &str = "com.nekoapi.widget";
 const KEYRING_USER: &str = "session";
 const TRAY_ID: &str = "nekoapi-status";
@@ -42,10 +44,61 @@ struct PopupState {
     last_blur: Mutex<Option<Instant>>,
 }
 
+#[derive(Default)]
+struct LotteryState {
+    enabled: Mutex<bool>,
+    last_notified_round_id: Mutex<Option<i64>>,
+}
+
+#[derive(Default)]
+struct LotteryMarker(Mutex<bool>);
+
+#[derive(Default)]
+struct TrayCache {
+    title: Mutex<String>,
+    tooltip: Mutex<String>,
+    channel_state: Mutex<Option<ChannelLightState>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Session {
     access_token: String,
     refresh_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LotterySettings {
+    enabled: bool,
+    last_notified_round_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LotteryRoundInfo {
+    id: i64,
+    number: Option<i64>,
+    title: Option<String>,
+    status: Option<String>,
+    reward_amount: Option<f64>,
+    participant_count: Option<i64>,
+    target_participants: Option<i64>,
+    closes_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LotteryEligibility {
+    eligible: Option<bool>,
+    reason_code: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LotterySnapshot {
+    server_enabled: bool,
+    has_open_round: bool,
+    participated: bool,
+    eligibility: LotteryEligibility,
+    current_round: Option<LotteryRoundInfo>,
+    fetched_at: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -350,6 +403,26 @@ async fn get_authorized(
     let response = client
         .get(format!("{API_BASE}{path}"))
         .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| format!("无法连接 NekoAPI：{error}"))?;
+    let status = response.status();
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|_| format!("站点返回了无法解析的数据（HTTP {status}）"))?;
+    Ok((status, value))
+}
+
+async fn post_authorized(
+    client: &Client,
+    path: &str,
+    token: &str,
+) -> Result<(StatusCode, Value), String> {
+    let response = client
+        .post(format!("{API_BASE}{path}"))
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_LENGTH, "0")
         .send()
         .await
         .map_err(|error| format!("无法连接 NekoAPI：{error}"))?;
@@ -669,7 +742,7 @@ fn channel_light_state(
         .unwrap_or(ChannelLightState::Unknown)
 }
 
-fn status_light_icon(state: ChannelLightState) -> Image<'static> {
+fn status_light_icon(state: ChannelLightState, lottery_marker: bool) -> Image<'static> {
     const SIZE: u32 = 32;
     const CENTER: f32 = (SIZE as f32 - 1.0) / 2.0;
     let mut rgba = vec![0; (SIZE * SIZE * 4) as usize];
@@ -684,7 +757,7 @@ fn status_light_icon(state: ChannelLightState) -> Image<'static> {
             // The UI uses a small flat dot with a subtle same-color glow.
             // Render the same shape at tray resolution without the previous
             // white ring, which looked like a generic traffic light.
-            let color = if distance <= 6.5 {
+            let mut color = if distance <= 6.5 {
                 fill
             } else if distance <= 10.5 {
                 let fade = ((10.5 - distance) / 4.0).clamp(0.0, 1.0);
@@ -697,6 +770,15 @@ fn status_light_icon(state: ChannelLightState) -> Image<'static> {
             } else {
                 [0, 0, 0, 0]
             };
+            // Windows never renders a tray title, so an in-progress lucky draw
+            // is surfaced as a small amber badge on the status light instead.
+            if lottery_marker {
+                let badge_dx = x as f32 - 25.0;
+                let badge_dy = y as f32 - 7.0;
+                if (badge_dx * badge_dx + badge_dy * badge_dy).sqrt() <= 4.5 {
+                    color = [226, 178, 108, 255];
+                }
+            }
             rgba[pixel..pixel + 4].copy_from_slice(&color);
         }
     }
@@ -772,13 +854,80 @@ fn set_status_summary(
     tooltip: &str,
     channel_state: ChannelLightState,
 ) {
-    #[cfg(target_os = "linux")]
-    write_linux_panel_status(title);
+    let cache = app.state::<TrayCache>();
+    if let Ok(mut current) = cache.title.lock() {
+        *current = title.to_string();
+    }
+    if let Ok(mut current) = cache.tooltip.lock() {
+        *current = tooltip.to_string();
+    }
+    if let Ok(mut current) = cache.channel_state.lock() {
+        *current = Some(channel_state);
+    }
+    render_tray(app);
+}
 
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let _ = tray.set_icon_with_as_template(Some(status_light_icon(channel_state)), false);
-        let _ = tray.set_title(Some(title));
-        let _ = tray.set_tooltip(Some(tooltip));
+fn render_tray(app: &tauri::AppHandle) {
+    let (title, tooltip, channel_state) = {
+        let cache = app.state::<TrayCache>();
+        let title = cache.title.lock().ok().map(|s| s.clone());
+        let tooltip = cache.tooltip.lock().ok().map(|s| s.clone()).unwrap_or_default();
+        let channel_state = cache
+            .channel_state
+            .lock()
+            .ok()
+            .and_then(|s| *s)
+            .unwrap_or(ChannelLightState::Unknown);
+        (title, tooltip, channel_state)
+    };
+    let marker = app
+        .state::<LotteryMarker>()
+        .0
+        .lock()
+        .map(|guard| *guard)
+        .unwrap_or(false);
+
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    // The icon can be updated even before the first dashboard sync, which keeps
+    // the lucky-draw badge responsive when only the lottery poll has run.
+    let _ = tray.set_icon_with_as_template(Some(status_light_icon(channel_state, marker)), false);
+
+    let Some(title) = title else { return };
+    if title.is_empty() {
+        return;
+    }
+    let marker_suffix = if marker { " · 抽奖" } else { "" };
+    // Windows truncates tray tooltips at 128 characters, so the lucky-draw
+    // marker leads the tooltip to stay visible no matter how long the quota
+    // and key details below it get.
+    let marker_tooltip = if marker { "幸运抽奖进行中\n" } else { "" };
+    let final_title = format!("{title}{marker_suffix}");
+    let final_tooltip = format!("{marker_tooltip}{tooltip}");
+
+    #[cfg(target_os = "linux")]
+    write_linux_panel_status(&final_title);
+
+    let _ = tray.set_title(Some(final_title.as_str()));
+    let _ = tray.set_tooltip(Some(final_tooltip.as_str()));
+}
+
+fn set_lottery_marker(app: &tauri::AppHandle, has_open_round: bool) {
+    let marker_state = app.state::<LotteryMarker>();
+    let changed = {
+        let Ok(mut guard) = marker_state.0.lock() else {
+            return;
+        };
+        if *guard == has_open_round {
+            false
+        } else {
+            *guard = has_open_round;
+            true
+        }
+    };
+    if changed {
+        render_tray(app);
     }
 }
 
@@ -1004,12 +1153,136 @@ mod tests {
 
     #[test]
     fn status_light_icon_has_expected_dimensions_and_center_color() {
-        let icon = status_light_icon(ChannelLightState::Operational);
+        let icon = status_light_icon(ChannelLightState::Operational, false);
         let debug = format!("{icon:?}");
 
         assert!(debug.contains("width: 32"));
         assert!(debug.contains("height: 32"));
         assert!(debug.contains("4096"));
+    }
+
+    #[test]
+    fn lottery_badge_changes_the_status_light_icon() {
+        let plain = status_light_icon(ChannelLightState::Operational, false)
+            .rgba()
+            .to_vec();
+        let badged = status_light_icon(ChannelLightState::Operational, true)
+            .rgba()
+            .to_vec();
+
+        assert_eq!(plain.len(), 32 * 32 * 4);
+        assert_eq!(badged.len(), plain.len());
+        assert_ne!(plain, badged);
+    }
+
+    #[test]
+    fn parses_lottery_snapshot_with_open_round() {
+        let payload = json!({
+            "enabled": true,
+            "current_round": {
+                "id": 42,
+                "number": 7,
+                "title": "测试抽奖",
+                "status": "open",
+                "participant_count": "10",
+                "target_participants": 100,
+                "reward_amount": "5.00",
+                "closes_at": "2026-09-15T10:00:00Z"
+            },
+            "eligibility": { "eligible": true }
+        });
+        let snapshot = parse_lottery_snapshot(payload, 1_700_000_000);
+        assert!(snapshot.server_enabled);
+        assert!(snapshot.has_open_round);
+        let round = snapshot.current_round.expect("round present");
+        assert_eq!(round.id, 42);
+        assert_eq!(round.number, Some(7));
+        assert_eq!(round.title.as_deref(), Some("测试抽奖"));
+        assert_eq!(round.reward_amount, Some(5.0));
+        assert_eq!(round.participant_count, Some(10));
+        assert_eq!(round.target_participants, Some(100));
+        assert_eq!(snapshot.eligibility.eligible, Some(true));
+        assert!(!snapshot.participated);
+    }
+
+    #[test]
+    fn parses_lottery_participation_and_ineligibility() {
+        let payload = json!({
+            "enabled": true,
+            "participated": true,
+            "current_round": {
+                "id": 8,
+                "number": 3,
+                "status": "open",
+                "participant_count": 4,
+                "target_participants": 20
+            },
+            "eligibility": {
+                "eligible": false,
+                "reason_code": "email_verification_required",
+                "reason": "需要先验证邮箱"
+            }
+        });
+        let snapshot = parse_lottery_snapshot(payload, 0);
+        assert!(snapshot.participated);
+        assert_eq!(snapshot.eligibility.eligible, Some(false));
+        assert_eq!(
+            snapshot.eligibility.reason_code.as_deref(),
+            Some("email_verification_required")
+        );
+        assert_eq!(snapshot.eligibility.reason.as_deref(), Some("需要先验证邮箱"));
+    }
+
+    #[test]
+    fn parses_lottery_snapshot_ignores_closed_or_full_rounds() {
+        let closed = json!({
+            "enabled": true,
+            "current_round": {
+                "id": 1,
+                "status": "closed",
+                "participant_count": 5,
+                "target_participants": 10
+            }
+        });
+        assert!(!parse_lottery_snapshot(closed, 0).has_open_round);
+
+        let full = json!({
+            "enabled": true,
+            "current_round": {
+                "id": 2,
+                "status": "open",
+                "participant_count": 100,
+                "target_participants": 100
+            }
+        });
+        assert!(!parse_lottery_snapshot(full, 0).has_open_round);
+    }
+
+    #[test]
+    fn parses_lottery_snapshot_without_current_round() {
+        let payload = json!({ "enabled": false, "current_round": null });
+        let snapshot = parse_lottery_snapshot(payload, 0);
+        assert!(!snapshot.server_enabled);
+        assert!(!snapshot.has_open_round);
+        assert!(snapshot.current_round.is_none());
+    }
+
+    #[test]
+    fn lottery_notification_body_includes_reward_and_progress() {
+        let round = LotteryRoundInfo {
+            id: 9,
+            number: Some(12),
+            title: Some("嘉年华".to_string()),
+            status: Some("open".to_string()),
+            reward_amount: Some(3.5),
+            participant_count: Some(15),
+            target_participants: Some(30),
+            closes_at: Some("2026-12-31T15:59:00Z".to_string()),
+        };
+        let body = format_lottery_notification_body(&round);
+        assert!(body.contains("第12期"));
+        assert!(body.contains("$3.50"));
+        assert!(body.contains("15/30"));
     }
 }
 
@@ -1093,6 +1366,30 @@ async fn get_payload_with_refresh(
     unwrap_payload(value)
 }
 
+async fn post_payload_with_refresh(
+    client: &Client,
+    path: &str,
+    session: &mut Session,
+) -> Result<Value, String> {
+    let (mut status, mut value) = post_authorized(client, path, &session.access_token).await?;
+    if status == StatusCode::UNAUTHORIZED {
+        *session = refresh_session(client, session).await.map_err(|error| {
+            let _ = delete_session();
+            error
+        })?;
+        (status, value) = post_authorized(client, path, &session.access_token).await?;
+    }
+
+    if status == StatusCode::UNAUTHORIZED {
+        let _ = delete_session();
+        return Err("登录已过期，请重新登录".to_string());
+    }
+    if !status.is_success() {
+        return Err(api_error(&value, &format!("请求失败（HTTP {status}）")));
+    }
+    unwrap_payload(value)
+}
+
 fn valid_date(value: &str) -> bool {
     value.len() == 10
         && value
@@ -1102,6 +1399,19 @@ fn valid_date(value: &str) -> bool {
                 4 | 7 => character == '-',
                 _ => character.is_ascii_digit(),
             })
+}
+
+fn urlencode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
 }
 
 #[tauri::command]
@@ -1129,6 +1439,288 @@ async fn fetch_usage_records(state: tauri::State<'_, ApiState>) -> Result<Value,
         &mut session,
     )
     .await
+}
+
+const LOTTERY_STATE_FILE: &str = "lottery-state.json";
+
+fn lottery_state_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join(LOTTERY_STATE_FILE))
+}
+
+fn load_lottery_settings(app: &tauri::AppHandle) -> LotterySettings {
+    lottery_state_path(app)
+        .and_then(|path| fs::read_to_string(&path).ok())
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or(LotterySettings {
+            enabled: true,
+            last_notified_round_id: None,
+        })
+}
+
+fn save_lottery_settings(
+    app: &tauri::AppHandle,
+    settings: &LotterySettings,
+) -> Result<(), String> {
+    let path = lottery_state_path(app).ok_or_else(|| "无法定位配置目录".to_string())?;
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let payload = serde_json::to_string(settings).map_err(|error| error.to_string())?;
+    fs::write(&path, payload).map_err(|error| format!("保存抽奖状态失败：{error}"))
+}
+
+fn lottery_value_to_i64(value: &Value) -> Option<i64> {
+    if let Some(number) = value.as_i64() {
+        return Some(number);
+    }
+    if let Some(text) = value.as_str() {
+        return text.parse::<i64>().ok();
+    }
+    if let Some(number) = value.as_f64() {
+        return Some(number as i64);
+    }
+    None
+}
+
+fn lottery_value_to_f64(value: &Value) -> Option<f64> {
+    if let Some(number) = value.as_f64() {
+        return Some(number);
+    }
+    if let Some(text) = value.as_str() {
+        return text.parse::<f64>().ok();
+    }
+    None
+}
+
+fn parse_lottery_snapshot(payload: Value, fetched_at: u64) -> LotterySnapshot {
+    let server_enabled = payload
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let round = payload
+        .get("current_round")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let has_round_object = round
+        .as_object()
+        .map(|object| !object.is_empty())
+        .unwrap_or(false);
+    let status = round.get("status").and_then(Value::as_str).unwrap_or("");
+    let participant_count =
+        lottery_value_to_i64(round.get("participant_count").unwrap_or(&Value::Null))
+            .unwrap_or(0);
+    let target_participants =
+        lottery_value_to_i64(round.get("target_participants").unwrap_or(&Value::Null))
+            .unwrap_or(0);
+    let is_open = has_round_object
+        && status == "open"
+        && participant_count < target_participants;
+
+    let current_round = if has_round_object {
+        lottery_value_to_i64(round.get("id").unwrap_or(&Value::Null)).map(|id| LotteryRoundInfo {
+            id,
+            number: lottery_value_to_i64(round.get("number").unwrap_or(&Value::Null)),
+            title: round
+                .get("title")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .or_else(|| {
+                    payload
+                        .get("activity_title")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                }),
+            status: round
+                .get("status")
+                .and_then(Value::as_str)
+                .map(String::from),
+            reward_amount: lottery_value_to_f64(
+                round.get("reward_amount").unwrap_or(&Value::Null),
+            ),
+            participant_count: Some(participant_count),
+            target_participants: Some(target_participants),
+            closes_at: round
+                .get("closes_at")
+                .and_then(Value::as_str)
+                .map(String::from),
+        })
+    } else {
+        None
+    };
+
+    LotterySnapshot {
+        server_enabled,
+        has_open_round: is_open && current_round.is_some(),
+        participated: payload
+            .get("participated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        eligibility: LotteryEligibility {
+            eligible: payload
+                .get("eligibility")
+                .and_then(|value| value.get("eligible"))
+                .and_then(Value::as_bool),
+            reason_code: payload
+                .get("eligibility")
+                .and_then(|value| value.get("reason_code"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(String::from),
+            reason: payload
+                .get("eligibility")
+                .and_then(|value| value.get("reason"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(String::from),
+        },
+        current_round,
+        fetched_at,
+    }
+}
+
+fn lottery_round_label(round: &LotteryRoundInfo) -> String {
+    match round.number {
+        Some(number) => format!("第{number}期"),
+        None => "新一期".to_string(),
+    }
+}
+
+fn format_lottery_notification_body(round: &LotteryRoundInfo) -> String {
+    let mut body = lottery_round_label(round);
+    if let Some(amount) = round.reward_amount {
+        body.push_str(&format!(" · 单人中奖 ${amount:.2}"));
+    }
+    if let (Some(current), Some(target)) = (round.participant_count, round.target_participants) {
+        if target > 0 {
+            body.push_str(&format!(" · 已报名 {current}/{target}"));
+        }
+    }
+    body
+}
+
+async fn fetch_lottery_payload(
+    client: &Client,
+    timezone: &str,
+) -> Result<LotterySnapshot, String> {
+    let trimmed = timezone.trim();
+    let tz = if trimmed.is_empty() { "UTC" } else { trimmed };
+    let mut session = load_session()?.ok_or_else(|| "请先登录".to_string())?;
+    let path = format!("/lottery?timezone={}", urlencode(tz));
+    let value = get_payload_with_refresh(client, &path, &mut session).await?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Ok(parse_lottery_snapshot(value, now))
+}
+
+#[tauri::command]
+async fn fetch_lottery(
+    state: tauri::State<'_, ApiState>,
+    timezone: String,
+) -> Result<LotterySnapshot, String> {
+    fetch_lottery_payload(&state.client, &timezone).await
+}
+
+#[tauri::command]
+async fn poll_lottery(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ApiState>,
+    lottery_state: tauri::State<'_, LotteryState>,
+    timezone: String,
+) -> Result<LotterySnapshot, String> {
+    let snapshot = fetch_lottery_payload(&state.client, &timezone).await?;
+    let enabled = lottery_state
+        .enabled
+        .lock()
+        .map(|value| *value)
+        .unwrap_or(true);
+    let mut persisted = load_lottery_settings(&app);
+    persisted.enabled = enabled;
+    let last_notified = lottery_state
+        .last_notified_round_id
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+        .or(persisted.last_notified_round_id);
+
+    let mut state_changed = false;
+    if let Some(round) = &snapshot.current_round {
+        if snapshot.has_open_round {
+            let new_last = Some(round.id);
+            if last_notified != new_last {
+                if let Ok(mut guard) = lottery_state.last_notified_round_id.lock() {
+                    *guard = new_last;
+                }
+                persisted.last_notified_round_id = new_last;
+                state_changed = true;
+                let first_poll = last_notified.is_none();
+                if !first_poll && enabled {
+                    let body = format_lottery_notification_body(round);
+                    let title_text = round
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "幸运抽奖".to_string());
+                    if let Err(error) = app
+                        .notification()
+                        .builder()
+                        .title(&title_text)
+                        .body(&body)
+                        .show()
+                    {
+                        eprintln!("[lottery] failed to show notification: {error}");
+                    }
+                }
+            }
+        }
+    }
+    if state_changed || persisted.enabled != enabled {
+        let _ = save_lottery_settings(&app, &persisted);
+    }
+    set_lottery_marker(&app, snapshot.has_open_round);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn join_lottery(
+    state: tauri::State<'_, ApiState>,
+    round_id: i64,
+) -> Result<Value, String> {
+    if round_id <= 0 {
+        return Err("抽奖期号无效".to_string());
+    }
+    let mut session = load_session()?.ok_or_else(|| "请先登录".to_string())?;
+    let path = format!("/lottery/rounds/{round_id}/join");
+    post_payload_with_refresh(&state.client, &path, &mut session).await
+}
+
+#[tauri::command]
+fn get_lottery_settings(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, LotteryState>,
+) -> Result<LotterySettings, String> {
+    let mut settings = load_lottery_settings(&app);
+    if let Ok(guard) = state.enabled.lock() {
+        settings.enabled = *guard;
+    }
+    Ok(settings)
+}
+
+#[tauri::command]
+fn set_lottery_notification_enabled(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, LotteryState>,
+    enabled: bool,
+) -> Result<(), String> {
+    if let Ok(mut guard) = state.enabled.lock() {
+        *guard = enabled;
+    }
+    let mut settings = load_lottery_settings(&app);
+    settings.enabled = enabled;
+    save_lottery_settings(&app, &settings)
 }
 
 #[tauri::command]
@@ -1451,7 +2043,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&toggle, &refresh, &quit])?;
     TrayIconBuilder::with_id(TRAY_ID)
-        .icon(status_light_icon(ChannelLightState::Unknown))
+        .icon(status_light_icon(ChannelLightState::Unknown, false))
         .icon_as_template(false)
         .title("-- · --%")
         .tooltip("NekoAPI Widget")
@@ -1484,19 +2076,28 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 pub fn run() {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(20))
-        .user_agent("NekoAPI-Widget/0.5.1 (+low-frequency account monitor)")
+        .user_agent("NekoAPI-Widget/0.5.2 (+low-frequency account monitor)")
         .build()
         .expect("failed to build HTTP client");
 
     tauri::Builder::default()
         .manage(ApiState { client })
         .manage(PopupState::default())
+        .manage(LotteryState::default())
+        .manage(LotteryMarker::default())
+        .manage(TrayCache::default())
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             login,
             login_two_factor,
             fetch_dashboard,
             fetch_usage_trend,
             fetch_usage_records,
+            fetch_lottery,
+            poll_lottery,
+            join_lottery,
+            get_lottery_settings,
+            set_lottery_notification_enabled,
             has_session,
             logout
         ])
@@ -1510,6 +2111,20 @@ pub fn run() {
                         .level(log::LevelFilter::Info)
                         .build(),
                 )?;
+            }
+
+            // Restore persisted lottery settings (enabled flag) into the
+            // managed state so the frontend reads the same value the user
+            // previously chose.
+            let handle = app.handle().clone();
+            let persisted = load_lottery_settings(&handle);
+            if let Some(state) = app.try_state::<LotteryState>() {
+                if let Ok(mut guard) = state.enabled.lock() {
+                    *guard = persisted.enabled;
+                }
+                if let Ok(mut guard) = state.last_notified_round_id.lock() {
+                    *guard = persisted.last_notified_round_id;
+                }
             }
 
             #[cfg(target_os = "linux")]

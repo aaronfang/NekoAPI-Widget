@@ -96,6 +96,25 @@ input::placeholder { color: #515863; }
 .settings-popover span { margin-top: 3px; color: var(--muted); font-size: 9px; }
 .settings-popover select { height: 36px; margin-top: 11px; padding: 0 10px; font-size: 11px; }
 .settings-popover button { width: 100%; margin-top: 9px; padding: 8px; border: 1px solid rgba(185,120,126,.18); border-radius: 8px; background: rgba(185,120,126,.06); color: #c88b91; font-size: 10px; cursor: pointer; }
+.settings-popover .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 10px; border: 1px solid var(--line-strong); border-radius: 9px; background: rgba(255,255,255,.02); color: var(--text); font-size: 11px; text-align: left; cursor: pointer; }
+.settings-popover .toggle-row > span { flex: 1; min-width: 0; margin-top: 0; }
+.settings-popover .toggle-row small { display: block; margin-top: 2px; color: var(--muted); font-size: 9px; line-height: 1.35; }
+.settings-popover .toggle-row.on { border-color: rgba(130,168,154,.35); background: rgba(130,168,154,.08); }
+.settings-popover .toggle-switch { position: relative; flex-shrink: 0; width: 30px; height: 16px; border-radius: 999px; background: rgba(118,125,137,.35); transition: background .18s ease; }
+.settings-popover .toggle-switch span { position: absolute; top: 2px; left: 2px; margin: 0; width: 12px; height: 12px; border-radius: 999px; background: #d8dce1; transition: transform .18s ease; }
+.settings-popover .toggle-switch.on { background: rgba(130,168,154,.6); }
+.settings-popover .toggle-switch.on span { transform: translateX(14px); background: #0c0f14; }
+.lottery-banner { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; padding: 9px 12px; border: 1px solid rgba(180,154,114,.28); border-radius: 10px; background: rgba(180,154,114,.08); color: var(--amber); font-size: 11px; }
+.lottery-banner svg { width: 16px; height: 16px; fill: currentColor; flex-shrink: 0; }
+.lottery-banner strong { color: #d9bd92; font-weight: 600; }
+.lottery-banner > span { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.lottery-banner em { flex-shrink: 0; padding: 2px 7px; border-radius: 999px; background: rgba(118,125,137,.18); color: var(--soft); font-size: 9px; font-style: normal; white-space: nowrap; }
+.lottery-banner.tone-ready em { background: rgba(130,168,154,.2); color: var(--sage-light); }
+.lottery-banner.tone-joined em { background: rgba(130,168,154,.14); color: var(--sage); }
+.lottery-banner.tone-blocked em { background: rgba(185,120,126,.14); color: #c88b91; }
+.lottery-banner .lottery-join { flex-shrink: 0; padding: 3px 11px; border: 1px solid rgba(130,168,154,.42); border-radius: 999px; background: rgba(130,168,154,.16); color: var(--sage-light); font-size: 10px; cursor: pointer; }
+.lottery-banner .lottery-join:hover:not(:disabled) { background: rgba(130,168,154,.28); }
+.lottery-banner .lottery-join:disabled { opacity: .55; cursor: default; }
 .toast { position: absolute; z-index: 9; top: 62px; left: 34px; right: 34px; padding: 8px 10px; border: 1px solid rgba(130,168,154,.17); border-radius: 9px; background: rgba(36,53,48,.96); color: var(--sage-light); font-size: 9px; text-align: center; box-shadow: 0 8px 24px rgba(0,0,0,.3); }
 .toast.danger { border-color: rgba(185,120,126,.18); background: rgba(55,34,38,.96); color: #d69ca1; }
 

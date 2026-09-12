@@ -4,6 +4,24 @@ on:
   push:
     tags:
       - "v*"
+  # Manual dispatch supports staged releases: build and attach one platform
+  # first (for example Windows), then append the remaining platforms to the
+  # same GitHub Release once they have been verified.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.5.2 (created if it does not exist)"
+        required: true
+      platforms:
+        description: "Which platform builds to attach to this release"
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - windows
+          - macos
+          - linux
 
 permissions:
   contents: write
@@ -11,6 +29,7 @@ permissions:
 jobs:
   windows:
     name: Windows x64
+    if: ${{ github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == 'windows' }}
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
@@ -36,6 +55,7 @@ jobs:
 
   macos:
     name: macOS universal
+    if: ${{ github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == 'macos' }}
     runs-on: macos-14
     timeout-minutes: 50
     steps:
@@ -61,6 +81,7 @@ jobs:
 
   linux:
     name: Linux x64
+    if: ${{ github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == 'linux' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -97,6 +118,10 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [windows, macos, linux]
+    # `always()` keeps this job running when some platform jobs were skipped
+    # by a staged dispatch, while `!failure()` still blocks the release when a
+    # build that did run has failed.
+    if: ${{ always() && !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -105,6 +130,7 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           generate_release_notes: true
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
           files: release-assets/**
