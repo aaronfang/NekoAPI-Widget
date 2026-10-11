@@ -61,7 +61,7 @@ XFCE 内建 systray 不显示 AppIndicator 的动态文字，也不向应用提�
 
 ```bash
 sudo apt install xfce4-genmon-plugin xdotool
-tar -xzf NekoAPI-Widget-v0.5.2-xfce-panel.tar.gz   # 替换为发布页上的实际标签
+tar -xzf NekoAPI-Widget-v0.5.3-xfce-panel.tar.gz   # 替换为发布页上的实际标签
 ./linux/install-xfce-panel.sh
 ```
 

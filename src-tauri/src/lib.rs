@@ -1,17 +1,20 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use keyring::Entry;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-#[cfg(target_os = "linux")]
-use std::{
-    io::{BufRead, BufReader, Write},
-    thread,
-};
+use sha2::Digest;
+use sha2::Sha256;
 use std::{
     fs,
     path::PathBuf,
     sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+#[cfg(target_os = "linux")]
+use std::{
+    io::{BufRead, BufReader, Write},
+    thread,
 };
 use tauri::{
     image::Image,
@@ -320,6 +323,123 @@ async fn post_auth(client: &Client, path: &str, body: Value) -> Result<Value, St
     response_json(response).await
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct AltchaChallenge {
+    parameters: AltchaParameters,
+    signature: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AltchaParameters {
+    algorithm: String,
+    nonce: String,
+    salt: String,
+    cost: u32,
+    key_length: usize,
+    key_prefix: String,
+    data: Value,
+    expires_at: Option<u64>,
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    if value.len() % 2 != 0 {
+        return Err("站点验证码参数无效".to_string());
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16)
+                .map_err(|_| "站点验证码参数无效".to_string())
+        })
+        .collect()
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut key_block = [0u8; 64];
+    if key.len() > 64 {
+        key_block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Vec::with_capacity(64 + message.len());
+    inner.extend(key_block.iter().map(|byte| byte ^ 0x36));
+    inner.extend_from_slice(message);
+    let inner_hash = Sha256::digest(&inner);
+    let mut outer = Vec::with_capacity(64 + 32);
+    outer.extend(key_block.iter().map(|byte| byte ^ 0x5c));
+    outer.extend_from_slice(&inner_hash);
+    Sha256::digest(&outer).into()
+}
+
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, key_length: usize) -> Vec<u8> {
+    let mut result = Vec::with_capacity(key_length);
+    for block_index in 1..=((key_length + 31) / 32) {
+        let mut block_input = salt.to_vec();
+        block_input.extend_from_slice(&(block_index as u32).to_be_bytes());
+        let mut u = hmac_sha256(password, &block_input);
+        let mut block = u;
+        for _ in 1..iterations {
+            u = hmac_sha256(password, &u);
+            for (target, byte) in block.iter_mut().zip(u) {
+                *target ^= byte;
+            }
+        }
+        result.extend_from_slice(&block);
+    }
+    result.truncate(key_length);
+    result
+}
+
+async fn altcha_payload(client: &Client) -> Result<String, String> {
+    let response = client
+        .get(format!("{API_BASE}/auth/captcha/altcha/challenge"))
+        .send()
+        .await
+        .map_err(|error| format!("无法连接 NekoAPI：{error}"))?;
+    let challenge: AltchaChallenge = serde_json::from_value(response_json(response).await?)
+        .map_err(|_| "站点验证码响应格式无效".to_string())?;
+    if challenge.parameters.algorithm != "PBKDF2/SHA-256" {
+        return Err("站点验证码算法暂不支持，请更新应用".to_string());
+    }
+    let nonce = decode_hex(&challenge.parameters.nonce)?;
+    let salt = decode_hex(&challenge.parameters.salt)?;
+    let prefix = challenge.parameters.key_prefix.to_ascii_lowercase();
+    let mut counter = 0u32;
+    let solution = loop {
+        let mut password = nonce.clone();
+        password.extend_from_slice(&counter.to_be_bytes());
+        let derived = pbkdf2_sha256(
+            &password,
+            &salt,
+            challenge.parameters.cost,
+            challenge.parameters.key_length,
+        );
+        let derived_hex = derived
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if derived_hex.starts_with(&prefix) {
+            break (counter, derived_hex);
+        }
+        counter = counter.saturating_add(1);
+    };
+    Ok(BASE64.encode(
+        serde_json::to_vec(&json!({
+            "challenge": {
+                "parameters": challenge.parameters,
+                "signature": challenge.signature,
+            },
+            "solution": {
+                "counter": solution.0,
+                "derivedKey": solution.1,
+                "took": 0,
+            },
+        }))
+        .map_err(|error| error.to_string())?,
+    ))
+}
+
 #[tauri::command]
 async fn login(
     state: tauri::State<'_, ApiState>,
@@ -333,10 +453,13 @@ async fn login(
 
     // The upstream accepts an email login. Supplying username as well keeps this
     // compatible with deployments that enable username-based authentication.
+    let altcha_payload = altcha_payload(&state.client).await?;
     let value = post_auth(
         &state.client,
         "/auth/login",
-        json!({ "email": account, "username": account, "password": password }),
+        // The web client sends ALTCHA's payload through the shared challenge
+        // field used by the other captcha providers.
+        json!({ "email": account, "username": account, "password": password, "turnstile_token": altcha_payload }),
     )
     .await?;
 
@@ -871,7 +994,12 @@ fn render_tray(app: &tauri::AppHandle) {
     let (title, tooltip, channel_state) = {
         let cache = app.state::<TrayCache>();
         let title = cache.title.lock().ok().map(|s| s.clone());
-        let tooltip = cache.tooltip.lock().ok().map(|s| s.clone()).unwrap_or_default();
+        let tooltip = cache
+            .tooltip
+            .lock()
+            .ok()
+            .map(|s| s.clone())
+            .unwrap_or_default();
         let channel_state = cache
             .channel_state
             .lock()
@@ -903,7 +1031,11 @@ fn render_tray(app: &tauri::AppHandle) {
     // Windows truncates tray tooltips at 128 characters, so the lucky-draw
     // marker leads the tooltip to stay visible no matter how long the quota
     // and key details below it get.
-    let marker_tooltip = if marker { "幸运抽奖进行中\n" } else { "" };
+    let marker_tooltip = if marker {
+        "幸运抽奖进行中\n"
+    } else {
+        ""
+    };
     let final_title = title;
     let final_tooltip = format!("{marker_tooltip}{tooltip}");
 
@@ -1231,7 +1363,10 @@ mod tests {
             snapshot.eligibility.reason_code.as_deref(),
             Some("email_verification_required")
         );
-        assert_eq!(snapshot.eligibility.reason.as_deref(), Some("需要先验证邮箱"));
+        assert_eq!(
+            snapshot.eligibility.reason.as_deref(),
+            Some("需要先验证邮箱")
+        );
     }
 
     #[test]
@@ -1461,10 +1596,7 @@ fn load_lottery_settings(app: &tauri::AppHandle) -> LotterySettings {
         })
 }
 
-fn save_lottery_settings(
-    app: &tauri::AppHandle,
-    settings: &LotterySettings,
-) -> Result<(), String> {
+fn save_lottery_settings(app: &tauri::AppHandle, settings: &LotterySettings) -> Result<(), String> {
     let path = lottery_state_path(app).ok_or_else(|| "无法定位配置目录".to_string())?;
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -1501,24 +1633,17 @@ fn parse_lottery_snapshot(payload: Value, fetched_at: u64) -> LotterySnapshot {
         .get("enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let round = payload
-        .get("current_round")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let round = payload.get("current_round").cloned().unwrap_or(Value::Null);
     let has_round_object = round
         .as_object()
         .map(|object| !object.is_empty())
         .unwrap_or(false);
     let status = round.get("status").and_then(Value::as_str).unwrap_or("");
     let participant_count =
-        lottery_value_to_i64(round.get("participant_count").unwrap_or(&Value::Null))
-            .unwrap_or(0);
+        lottery_value_to_i64(round.get("participant_count").unwrap_or(&Value::Null)).unwrap_or(0);
     let target_participants =
-        lottery_value_to_i64(round.get("target_participants").unwrap_or(&Value::Null))
-            .unwrap_or(0);
-    let is_open = has_round_object
-        && status == "open"
-        && participant_count < target_participants;
+        lottery_value_to_i64(round.get("target_participants").unwrap_or(&Value::Null)).unwrap_or(0);
+    let is_open = has_round_object && status == "open" && participant_count < target_participants;
 
     let current_round = if has_round_object {
         lottery_value_to_i64(round.get("id").unwrap_or(&Value::Null)).map(|id| LotteryRoundInfo {
@@ -1538,9 +1663,7 @@ fn parse_lottery_snapshot(payload: Value, fetched_at: u64) -> LotterySnapshot {
                 .get("status")
                 .and_then(Value::as_str)
                 .map(String::from),
-            reward_amount: lottery_value_to_f64(
-                round.get("reward_amount").unwrap_or(&Value::Null),
-            ),
+            reward_amount: lottery_value_to_f64(round.get("reward_amount").unwrap_or(&Value::Null)),
             participant_count: Some(participant_count),
             target_participants: Some(target_participants),
             closes_at: round
@@ -1602,10 +1725,7 @@ fn format_lottery_notification_body(round: &LotteryRoundInfo) -> String {
     body
 }
 
-async fn fetch_lottery_payload(
-    client: &Client,
-    timezone: &str,
-) -> Result<LotterySnapshot, String> {
+async fn fetch_lottery_payload(client: &Client, timezone: &str) -> Result<LotterySnapshot, String> {
     let trimmed = timezone.trim();
     let tz = if trimmed.is_empty() { "UTC" } else { trimmed };
     let mut session = load_session()?.ok_or_else(|| "请先登录".to_string())?;
@@ -1686,10 +1806,7 @@ async fn poll_lottery(
 }
 
 #[tauri::command]
-async fn join_lottery(
-    state: tauri::State<'_, ApiState>,
-    round_id: i64,
-) -> Result<Value, String> {
+async fn join_lottery(state: tauri::State<'_, ApiState>, round_id: i64) -> Result<Value, String> {
     if round_id <= 0 {
         return Err("抽奖期号无效".to_string());
     }
