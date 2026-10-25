@@ -405,6 +405,7 @@ async fn altcha_payload(client: &Client) -> Result<String, String> {
     let nonce = decode_hex(&challenge.parameters.nonce)?;
     let salt = decode_hex(&challenge.parameters.salt)?;
     let prefix = challenge.parameters.key_prefix.to_ascii_lowercase();
+    let solution_started = Instant::now();
     let mut counter = 0u32;
     let solution = loop {
         let mut password = nonce.clone();
@@ -433,11 +434,19 @@ async fn altcha_payload(client: &Client) -> Result<String, String> {
             "solution": {
                 "counter": solution.0,
                 "derivedKey": solution.1,
-                "took": 0,
+                "took": solution_started.elapsed().as_millis(),
             },
         }))
         .map_err(|error| error.to_string())?,
     ))
+}
+
+fn is_expired_captcha_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("verification expired")
+        || error.contains("verification is invalid")
+        || (error.contains("captcha") && (error.contains("expired") || error.contains("invalid")))
+        || (error.contains("altcha") && (error.contains("expired") || error.contains("invalid")))
 }
 
 #[tauri::command]
@@ -453,15 +462,27 @@ async fn login(
 
     // The upstream accepts an email login. Supplying username as well keeps this
     // compatible with deployments that enable username-based authentication.
-    let altcha_payload = altcha_payload(&state.client).await?;
-    let value = post_auth(
-        &state.client,
-        "/auth/login",
-        // The web client sends ALTCHA's payload through the shared challenge
-        // field used by the other captcha providers.
-        json!({ "email": account, "username": account, "password": password, "turnstile_token": altcha_payload }),
-    )
-    .await?;
+    let mut login_value = None;
+    for attempt in 0..=1 {
+        let altcha_payload = altcha_payload(&state.client).await?;
+        let result = post_auth(
+            &state.client,
+            "/auth/login",
+            // The web client sends ALTCHA's payload through the shared challenge
+            // field used by the other captcha providers.
+            json!({ "email": account, "username": account, "password": password, "turnstile_token": altcha_payload }),
+        )
+        .await;
+        match result {
+            Ok(value) => {
+                login_value = Some(value);
+                break;
+            }
+            Err(error) if attempt == 0 && is_expired_captcha_error(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let value = login_value.ok_or_else(|| "验证码已过期，请重试登录".to_string())?;
 
     if value
         .get("requires_2fa")
@@ -1067,6 +1088,16 @@ fn set_lottery_marker(app: &tauri::AppHandle, has_open_round: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_only_expired_or_invalid_captcha_errors() {
+        assert!(is_expired_captcha_error(
+            "verification expired or invalid; please try again"
+        ));
+        assert!(is_expired_captcha_error("ALTCHA challenge expired"));
+        assert!(!is_expired_captcha_error("Invalid username or password"));
+        assert!(!is_expired_captcha_error("Too many login attempts"));
+    }
 
     #[test]
     fn selects_highest_usage_across_subscriptions_and_periods() {
